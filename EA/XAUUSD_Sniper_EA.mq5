@@ -3,11 +3,11 @@
 //|  Multi-Timeframe Confluence Dashboard                            |
 //|  Timeframes: H4 > H1 > M15 (Primary) | H1 > M15 > M5 (Fallback)|
 //|  Attach to ANY timeframe — dashboard always works                |
-//|  Capital Protection: Breakeven + Trailing SL + Partial TP       |
+//|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "2.00"
-#property description "Multi-TF Sniper Dashboard for XAUUSD with Capital Protection"
+#property version     "3.00"
+#property description "Multi-TF Sniper Dashboard for XAUUSD — Full Capital Protection"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,12 +25,18 @@ input int              Sweep_Lookback    = 5;      // Liquidity Sweep lookback b
 input int              MinPrimaryScore   = 7;      // Min score for primary trade
 input int              MinFallbackScore  = 9;      // Min score for fallback trade
 
-input group            "=== RISK MANAGEMENT ==="
+input group            "=== RISK PER TRADE ==="
 input double           PrimaryRisk       = 2.0;    // Primary risk % per trade
 input double           FallbackRisk      = 1.0;    // Fallback risk % per trade
 input double           MinRR             = 2.0;    // Minimum Risk:Reward
 
-input group            "=== CAPITAL PROTECTION ==="
+input group            "=== DAILY PROFIT & LOSS LIMITS ==="
+input double           DailyProfitTarget = 5.0;    // Daily profit target % (e.g. 5 = stop at +5%)
+input double           DailyLossLimit    = 2.0;    // Daily max loss % (e.g. 2 = stop at -2%)
+input int              MaxDailyTrades    = 3;       // Max total trades per day
+input int              MaxConsecLosses   = 2;       // Max consecutive losses before stopping
+
+input group            "=== TRADE PROTECTION ==="
 input bool             UseBreakeven      = true;   // Move SL to entry when profitable
 input double           BreakevenTrigger  = 1.0;    // Profit (x SL distance) to activate BE
 input double           BreakevenBuffer   = 2.0;    // Extra pips above entry for BE
@@ -42,6 +48,19 @@ input bool             UsePartialTP      = true;   // Close partial position at 
 input double           PartialTPPercent  = 50.0;   // % of position to close at TP1
 input double           TP1_RR            = 1.0;    // TP1 Risk:Reward ratio (1:1)
 input double           TP2_RR            = 3.0;    // TP2 Risk:Reward ratio (1:3)
+
+input group            "=== SPREAD & SLIPPAGE FILTER ==="
+input double           MaxSpreadPips     = 30.0;   // Max allowed spread in pips
+input int              MaxSlippagePips   = 3;       // Max slippage in pips
+
+input group            "=== NEWS FILTER ==="
+input bool             UseNewsFilter     = true;   // Block trades near news
+input int              NewsMinutesBefore = 30;     // Minutes before news to block
+input int              NewsMinutesAfter  = 30;     // Minutes after news to block
+
+input group            "=== ACCOUNT FLOOR ==="
+input bool             UseBalanceFloor   = true;   // Stop trading below minimum balance
+input double           MinBalanceUSD     = 100.0;  // Minimum account balance in USD
 
 input group            "=== DASHBOARD ==="
 input int              Dashboard_X       = 20;     // Dashboard X position
@@ -108,18 +127,219 @@ struct TradeState {
    bool     isBuy;
 };
 
-TradeState g_Trades[];   // Tracks all open positions
-string     g_ProtectionStatus = "No open trades";
+TradeState g_Trades[];            // Tracks all open positions
+string     g_ProtectionStatus  = "No open trades";
+
+//--- Daily tracking (resets each new day)
+datetime   g_TradeDay          = 0;      // Current trading day
+double     g_DayStartBalance   = 0;      // Balance at start of day
+double     g_DailyPnL          = 0;      // Today's P&L in %
+int        g_DailyTradeCount   = 0;      // Trades taken today
+int        g_ConsecLosses      = 0;      // Consecutive losses
+bool       g_DailyProfitHit    = false;  // Daily profit target reached
+bool       g_DailyLossHit      = false;  // Daily loss limit hit
+bool       g_MaxTradesHit      = false;  // Max daily trades hit
+bool       g_ConsecLossHit     = false;  // Max consecutive losses hit
+
+//--- News event times (UTC) — major events affecting XAUUSD
+//    Format: hour * 100 + minute (e.g. 1330 = 13:30 UTC)
+//    These are fixed weekly/monthly schedule times
+int g_NewsEvents[] = {
+   1330,   // US CPI / NFP / GDP (13:30 UTC = 21:30 PHT)
+   1800,   // Fed Rate Decision (18:00 UTC = 02:00 PHT next day)
+   1400,   // FOMC Minutes (14:00 UTC = 22:00 PHT)
+   1500    // US Retail Sales (15:00 UTC = 23:00 PHT)
+};
+
+//--- Lot size calculator state
+double     g_LastLotSize       = 0;
+string     g_BlockReason       = "";     // Why trading is blocked
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
-   EventSetTimer(5); // Update every 5 seconds
+   EventSetTimer(5);
+   Trade.SetDeviationInPoints(MaxSlippagePips * 10);
+   ResetDailyTracking();
    CreateDashboard();
    AnalyzeAllTimeframes();
    UpdateDashboard();
    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Reset daily tracking at start of new day                        |
+//+------------------------------------------------------------------+
+void ResetDailyTracking() {
+   g_DayStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_DailyPnL         = 0;
+   g_DailyTradeCount  = 0;
+   g_ConsecLosses     = 0;
+   g_DailyProfitHit   = false;
+   g_DailyLossHit     = false;
+   g_MaxTradesHit     = false;
+   g_ConsecLossHit    = false;
+   g_BlockReason      = "";
+}
+
+//+------------------------------------------------------------------+
+//| Check if new trading day started                                |
+//+------------------------------------------------------------------+
+void CheckNewDay() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime today = StringToTime(StringFormat("%04d.%02d.%02d 00:00",
+                                              dt.year, dt.mon, dt.day));
+   if(today != g_TradeDay) {
+      g_TradeDay = today;
+      ResetDailyTracking();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate daily P&L as percentage of start balance             |
+//+------------------------------------------------------------------+
+void UpdateDailyPnL() {
+   if(g_DayStartBalance <= 0) return;
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_DailyPnL = ((currentEquity - g_DayStartBalance) / g_DayStartBalance) * 100.0;
+
+   // Check profit target hit
+   if(g_DailyPnL >= DailyProfitTarget) {
+      g_DailyProfitHit = true;
+      g_BlockReason    = StringFormat("Daily profit target reached: +%.2f%%", g_DailyPnL);
+   }
+   // Check loss limit hit
+   if(g_DailyPnL <= -DailyLossLimit) {
+      g_DailyLossHit = true;
+      g_BlockReason  = StringFormat("Daily loss limit hit: %.2f%%", g_DailyPnL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check spread — returns true if spread is acceptable            |
+//+------------------------------------------------------------------+
+bool IsSpreadOK() {
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+                   SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double spreadPips = spread / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+   return spreadPips <= MaxSpreadPips;
+}
+
+//+------------------------------------------------------------------+
+//| Check if near a scheduled news event                           |
+//+------------------------------------------------------------------+
+bool IsNearNews() {
+   if(!UseNewsFilter) return false;
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
+   int nowHHMM = dt.hour * 100 + dt.min;
+
+   for(int i = 0; i < ArraySize(g_NewsEvents); i++) {
+      int newsHHMM  = g_NewsEvents[i];
+      int newsTotal = (newsHHMM / 100) * 60 + (newsHHMM % 100);
+      int nowTotal  = dt.hour * 60 + dt.min;
+      int diff      = nowTotal - newsTotal;
+
+      if(diff >= -NewsMinutesBefore && diff <= NewsMinutesAfter)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check account balance floor                                     |
+//+------------------------------------------------------------------+
+bool IsBalanceOK() {
+   if(!UseBalanceFloor) return true;
+   return AccountInfoDouble(ACCOUNT_BALANCE) >= MinBalanceUSD;
+}
+
+//+------------------------------------------------------------------+
+//| Auto-calculate lot size based on risk % and SL distance        |
+//+------------------------------------------------------------------+
+double CalcLotSize(double riskPercent, double slPips) {
+   if(slPips <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * riskPercent / 100.0;
+   double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point      = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip        = point * 10;
+
+   if(tickValue <= 0 || tickSize <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double pipValue   = (pip / tickSize) * tickValue;
+   double lots       = riskAmount / (slPips * pipValue);
+
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lots = MathFloor(lots / lotStep) * lotStep;
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Master gate — is trading allowed right now?                    |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed() {
+   if(!IsBalanceOK()) {
+      g_BlockReason = StringFormat("Balance below floor ($%.2f)", MinBalanceUSD);
+      return false;
+   }
+   if(g_DailyProfitHit) {
+      g_BlockReason = StringFormat("Daily profit target hit: +%.2f%%  — Come back tomorrow",
+                                    DailyProfitTarget);
+      return false;
+   }
+   if(g_DailyLossHit) {
+      g_BlockReason = StringFormat("Daily loss limit hit: -%.2f%%  — Come back tomorrow",
+                                    DailyLossLimit);
+      return false;
+   }
+   if(g_MaxTradesHit) {
+      g_BlockReason = StringFormat("Max daily trades reached (%d)", MaxDailyTrades);
+      return false;
+   }
+   if(g_ConsecLossHit) {
+      g_BlockReason = StringFormat("Max consecutive losses (%d) — Stop for today",
+                                    MaxConsecLosses);
+      return false;
+   }
+   if(!IsSpreadOK()) {
+      double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+                      SymbolInfoDouble(_Symbol, SYMBOL_POINT) /
+                      (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+      g_BlockReason = StringFormat("Spread too wide: %.1f pips (max %.0f)", spread, MaxSpreadPips);
+      return false;
+   }
+   if(IsNearNews()) {
+      g_BlockReason = "Near scheduled news event — waiting";
+      return false;
+   }
+   g_BlockReason = "";
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Call after each closed trade to update counters                |
+//+------------------------------------------------------------------+
+void OnTradeClose(bool wasWin) {
+   g_DailyTradeCount++;
+   if(g_DailyTradeCount >= MaxDailyTrades)
+      g_MaxTradesHit = true;
+
+   if(wasWin) {
+      g_ConsecLosses = 0;
+   } else {
+      g_ConsecLosses++;
+      if(g_ConsecLosses >= MaxConsecLosses)
+         g_ConsecLossHit = true;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -134,6 +354,8 @@ void OnDeinit(const int reason) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
+   CheckNewDay();
+   UpdateDailyPnL();
    ManageCapitalProtection();
    AnalyzeAllTimeframes();
    UpdateDashboard();
@@ -532,6 +754,10 @@ string GetSession() {
 //| Build trade recommendation                                       |
 //+------------------------------------------------------------------+
 string GetRecommendation() {
+   // Check master gate first
+   if(!IsTradingAllowed())
+      return StringFormat("BLOCKED: %s", g_BlockReason);
+
    bool inTradeSession = (g_Session == "London Open — TRADE WINDOW 1" ||
                           g_Session == "New York Open — TRADE WINDOW 2 (BEST)" ||
                           g_Session == "London Session (Selective)");
@@ -541,19 +767,25 @@ string GetRecommendation() {
 
    // Primary strategy
    if(g_PrimaryScore >= MinPrimaryScore) {
-      string dir = g_H4.bullish ? "BUY" : "SELL";
-      return StringFormat("PRIMARY TRADE: %s | Score %d/13 | Risk %.1f%%",
-                          dir, g_PrimaryScore, PrimaryRisk);
+      string dir   = g_H4.bullish ? "BUY" : "SELL";
+      double slPips = 15.0; // Estimated — replaced by actual SL on entry
+      double lots   = CalcLotSize(PrimaryRisk, slPips);
+      g_LastLotSize = lots;
+      return StringFormat("PRIMARY TRADE: %s | Score %d/13 | Risk %.1f%% | Lots: %.2f",
+                          dir, g_PrimaryScore, PrimaryRisk, lots);
    }
 
    // Fallback strategy
    if(g_FallbackScore >= MinFallbackScore) {
-      string dir = g_H1.bullish ? "BUY" : "SELL";
-      return StringFormat("FALLBACK TRADE: %s | Score %d/13 | Risk %.1f%%",
-                          dir, g_FallbackScore, FallbackRisk);
+      string dir   = g_H1.bullish ? "BUY" : "SELL";
+      double slPips = 10.0;
+      double lots   = CalcLotSize(FallbackRisk, slPips);
+      g_LastLotSize = lots;
+      return StringFormat("FALLBACK TRADE: %s | Score %d/13 | Risk %.1f%% | Lots: %.2f",
+                          dir, g_FallbackScore, FallbackRisk, lots);
    }
 
-   return StringFormat("NO TRADE — Primary: %d/13 | Fallback: %d/13 | Wait",
+   return StringFormat("NO TRADE — Primary: %d/13 | Fallback: %d/13 | Wait for confluence",
                        g_PrimaryScore, g_FallbackScore);
 }
 
@@ -563,7 +795,7 @@ string GetRecommendation() {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 36 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 46 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -703,9 +935,69 @@ void UpdateDashboard() {
    SetLabel(PREFIX+"REC", x, y, g_Recommendation, recColor, FontSize);
    y += dy;
 
+   // ── DAILY STATS & LIMITS ──
+   y += dy;
+   SetLabel(PREFIX+"DSH", x, y, "── DAILY STATS & LIMITS ──", ColorHeader, FontSize);
+   y += dy;
+
+   // Balance and equity
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   SetLabel(PREFIX+"DS1", x, y,
+            StringFormat("Balance: $%.2f   Equity: $%.2f   Day Start: $%.2f",
+                         balance, equity, g_DayStartBalance),
+            ColorText, FontSize);
+   y += dy;
+
+   // Daily P&L bar
+   color pnlColor = (g_DailyPnL >= 0) ? ColorBull : ColorBear;
+   string pnlBar  = "";
+   int    bars2   = (int)MathMin(MathAbs(g_DailyPnL) * 4, 20);
+   for(int b = 0; b < bars2; b++) pnlBar += "|";
+   SetLabel(PREFIX+"DS2", x, y,
+            StringFormat("Daily P&L: %+.2f%%  [%s]   Target: +%.1f%%  Limit: -%.1f%%",
+                         g_DailyPnL, pnlBar, DailyProfitTarget, DailyLossLimit),
+            pnlColor, FontSize);
+   y += dy;
+
+   // Trade counters
+   color tradeCountColor = (g_DailyTradeCount >= MaxDailyTrades) ? ColorBear : ColorText;
+   SetLabel(PREFIX+"DS3", x, y,
+            StringFormat("Trades Today: %d / %d   Consec Losses: %d / %d   Spread: %.1f pips",
+                         g_DailyTradeCount, MaxDailyTrades,
+                         g_ConsecLosses, MaxConsecLosses,
+                         (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+                         SymbolInfoDouble(_Symbol, SYMBOL_POINT) /
+                         (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10)),
+            tradeCountColor, FontSize);
+   y += dy;
+
+   // Filters status row
+   string spreadOK = IsSpreadOK()   ? "Spread:OK" : "Spread:HIGH";
+   string newsOK   = !IsNearNews()  ? "News:Clear" : "News:BLOCKED";
+   string balOK    = IsBalanceOK()  ? "Balance:OK" : "Balance:LOW";
+   string gateOK   = IsTradingAllowed() ? "GATE: OPEN" : "GATE: CLOSED";
+   color  gateClr  = IsTradingAllowed() ? ColorBull : ColorBear;
+   color  spreadClr = IsSpreadOK()  ? ColorBull : ColorBear;
+   color  newsClr   = !IsNearNews() ? ColorBull : ColorBear;
+   color  balClr    = IsBalanceOK() ? ColorBull : ColorBear;
+
+   SetLabel(PREFIX+"DS4a", x,       y, gateOK,    gateClr,   FontSize);
+   SetLabel(PREFIX+"DS4b", x + 110, y, spreadOK,  spreadClr, FontSize);
+   SetLabel(PREFIX+"DS4c", x + 210, y, newsOK,    newsClr,   FontSize);
+   SetLabel(PREFIX+"DS4d", x + 310, y, balOK,     balClr,    FontSize);
+   y += dy;
+
+   // Block reason if any
+   if(g_BlockReason != "") {
+      SetLabel(PREFIX+"DS5", x, y,
+               StringFormat("! %s", g_BlockReason), ColorBear, FontSize);
+      y += dy;
+   }
+
    // ── CAPITAL PROTECTION STATUS ──
    y += dy;
-   SetLabel(PREFIX+"CPH", x, y, "── CAPITAL PROTECTION ──", ColorHeader, FontSize);
+   SetLabel(PREFIX+"CPH", x, y, "── TRADE PROTECTION ──", ColorHeader, FontSize);
    y += dy;
 
    // Settings summary
