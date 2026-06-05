@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "8.00"
-#property description "XAUUSD Sniper EA — Advanced SMC Engine v8.0"
+#property version     "9.00"
+#property description "XAUUSD Sniper EA — DXY Correlation + Candle Confirmation v9.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -49,6 +49,18 @@ input bool             UsePartialTP      = true;   // Close partial position at 
 input double           PartialTPPercent  = 50.0;   // % of position to close at TP1
 input double           TP1_RR            = 1.0;    // TP1 Risk:Reward ratio (1:1)
 input double           TP2_RR            = 3.0;    // TP2 Risk:Reward ratio (1:3)
+
+input group            "=== DXY CORRELATION FILTER ==="
+input bool             UseDXYFilter      = true;   // Block trades conflicting with DXY direction
+input string           DXY_Symbol        = "USDX"; // DXY symbol on your broker (try USDX, DXY, DX)
+input int              DXY_Lookback      = 20;     // Bars to determine DXY trend
+input double           DXY_MinMove       = 0.10;   // Min DXY move (price units) to confirm trend
+
+input group            "=== CANDLE CONFIRMATION FILTER ==="
+input bool             UseCandleConfirm  = true;   // Require confirmation candle before entry
+input double           EngulfMinRatio    = 1.2;    // Engulfing body must be X times previous body
+input double           PinBarWickRatio   = 2.0;    // Wick must be X times body for pin bar
+input double           MinBodyPips       = 3.0;    // Minimum body size in pips to count as valid
 
 input group            "=== SPREAD & SLIPPAGE FILTER ==="
 input double           MaxSpreadPips     = 30.0;   // Max allowed spread in pips
@@ -206,6 +218,17 @@ int g_NewsEvents[] = {
    1400,   // FOMC Minutes (14:00 UTC = 22:00 PHT)
    1500    // US Retail Sales (15:00 UTC = 23:00 PHT)
 };
+
+//--- DXY state
+bool       g_DXY_Available     = false;  // True if DXY symbol found on broker
+bool       g_DXY_Bullish       = false;  // DXY trending up (bad for gold BUY)
+double     g_DXY_Price         = 0;      // Latest DXY price
+double     g_DXY_Change        = 0;      // DXY change over lookback
+string     g_DXY_Status        = "N/A";  // Human-readable DXY status
+
+//--- Candle confirmation state
+bool       g_CandleConfirmed   = false;  // Latest candle confirmation result
+string     g_CandlePattern     = "None"; // Pattern detected: Engulf / PinBar / None
 
 //--- Lot size calculator state
 double     g_LastLotSize       = 0;
@@ -396,6 +419,160 @@ bool IsNearNews() {
       if(diff >= -NewsMinutesBefore && diff <= NewsMinutesAfter)
          return true;
    }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| DXY Correlation — reads DXY trend from broker                  |
+//| Gold is inversely correlated: DXY up = gold down               |
+//+------------------------------------------------------------------+
+void UpdateDXY() {
+   g_DXY_Available = false;
+   g_DXY_Status    = "N/A";
+
+   // Check if DXY symbol exists on this broker
+   if(!SymbolSelect(DXY_Symbol, true)) {
+      g_DXY_Status = "Symbol not found: " + DXY_Symbol;
+      return;
+   }
+
+   double dxyClose[];
+   ArraySetAsSeries(dxyClose, true);
+   int copied = CopyClose(DXY_Symbol, PERIOD_H4, 0, DXY_Lookback + 1, dxyClose);
+   if(copied < DXY_Lookback + 1) {
+      g_DXY_Status = "Loading DXY data...";
+      return;
+   }
+
+   g_DXY_Available = true;
+   g_DXY_Price     = dxyClose[0];
+   g_DXY_Change    = dxyClose[0] - dxyClose[DXY_Lookback];
+
+   // DXY bullish = USD strengthening = headwind for gold BUY
+   if(g_DXY_Change >= DXY_MinMove) {
+      g_DXY_Bullish = true;
+      g_DXY_Status  = StringFormat("BULLISH +%.3f | Gold headwind — avoid BUY", g_DXY_Change);
+   } else if(g_DXY_Change <= -DXY_MinMove) {
+      g_DXY_Bullish = false;
+      g_DXY_Status  = StringFormat("BEARISH %.3f | Gold tailwind — favor BUY", g_DXY_Change);
+   } else {
+      // Ranging DXY — no strong signal, allow both directions
+      g_DXY_Bullish = false;
+      g_DXY_Status  = StringFormat("RANGING %.3f | Neutral for gold", g_DXY_Change);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DXY filter check — returns true if trade direction is OK        |
+//+------------------------------------------------------------------+
+bool IsDXYAligned(bool isBuyTrade) {
+   if(!UseDXYFilter)      return true;
+   if(!g_DXY_Available)   return true; // If DXY not available, don't block
+
+   // DXY ranging = both directions allowed
+   if(MathAbs(g_DXY_Change) < DXY_MinMove) return true;
+
+   // BUY gold requires DXY bearish (USD weakening)
+   if(isBuyTrade  &&  g_DXY_Bullish) return false;
+   // SELL gold requires DXY bullish (USD strengthening)
+   if(!isBuyTrade && !g_DXY_Bullish) return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Candle Confirmation — checks for engulfing or pin bar           |
+//| at the entry timeframe before allowing auto entry               |
+//+------------------------------------------------------------------+
+bool CheckCandleConfirmation(bool isBuy, ENUM_TIMEFRAMES tf) {
+   if(!UseCandleConfirm) { g_CandlePattern = "Filter OFF"; return true; }
+
+   double open[], high[], low[], close[];
+   ArraySetAsSeries(open,  true);
+   ArraySetAsSeries(high,  true);
+   ArraySetAsSeries(low,   true);
+   ArraySetAsSeries(close, true);
+
+   if(CopyOpen (tf, 0, 3, open)  < 3 ||
+      CopyHigh (tf, 0, 3, high)  < 3 ||
+      CopyLow  (tf, 0, 3, low)   < 3 ||
+      CopyClose(tf, 0, 3, close) < 3) {
+      g_CandlePattern = "No data";
+      return false;
+   }
+
+   double pip      = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double minBody  = MinBodyPips * pip;
+
+   // Current completed candle = index 1 (index 0 = still forming)
+   double body1    = MathAbs(close[1] - open[1]);
+   double body2    = MathAbs(close[2] - open[2]);
+   double range1   = high[1] - low[1];
+   bool   bull1    = close[1] > open[1];
+
+   // ── BULLISH ENGULFING — for BUY confirmation ──
+   if(isBuy && bull1 && body1 >= minBody) {
+      // Body engulfs previous candle body
+      bool engulfs = (open[1] <= close[2] && close[1] >= open[2]);
+      // Body is larger than previous
+      bool bigger  = (body2 > 0 && body1 >= body2 * EngulfMinRatio);
+      if(engulfs || bigger) {
+         g_CandlePattern = "Bullish Engulf";
+         g_CandleConfirmed = true;
+         return true;
+      }
+   }
+
+   // ── BEARISH ENGULFING — for SELL confirmation ──
+   if(!isBuy && !bull1 && body1 >= minBody) {
+      bool engulfs = (open[1] >= close[2] && close[1] <= open[2]);
+      bool bigger  = (body2 > 0 && body1 >= body2 * EngulfMinRatio);
+      if(engulfs || bigger) {
+         g_CandlePattern = "Bearish Engulf";
+         g_CandleConfirmed = true;
+         return true;
+      }
+   }
+
+   // ── BULLISH PIN BAR — hammer, for BUY confirmation ──
+   if(isBuy && range1 > 0 && body1 >= minBody) {
+      double lowerWick = MathMin(open[1], close[1]) - low[1];
+      double upperWick = high[1] - MathMax(open[1], close[1]);
+      // Lower wick much longer than body, small upper wick
+      bool isPinBar = (lowerWick >= body1 * PinBarWickRatio &&
+                       upperWick <= body1 * 0.5);
+      if(isPinBar) {
+         g_CandlePattern = "Bullish Pin Bar";
+         g_CandleConfirmed = true;
+         return true;
+      }
+   }
+
+   // ── BEARISH PIN BAR — shooting star, for SELL confirmation ──
+   if(!isBuy && range1 > 0 && body1 >= minBody) {
+      double upperWick = high[1] - MathMax(open[1], close[1]);
+      double lowerWick = MathMin(open[1], close[1]) - low[1];
+      bool isPinBar = (upperWick >= body1 * PinBarWickRatio &&
+                       lowerWick <= body1 * 0.5);
+      if(isPinBar) {
+         g_CandlePattern = "Bearish Pin Bar";
+         g_CandleConfirmed = true;
+         return true;
+      }
+   }
+
+   // ── STRONG MOMENTUM CANDLE — body > 70% of range ──
+   if(body1 >= minBody && range1 > 0 && body1 / range1 >= 0.70) {
+      bool dirMatch = isBuy ? bull1 : !bull1;
+      if(dirMatch) {
+         g_CandlePattern = "Strong Momentum";
+         g_CandleConfirmed = true;
+         return true;
+      }
+   }
+
+   g_CandlePattern   = "No confirmation";
+   g_CandleConfirmed = false;
    return false;
 }
 
@@ -671,6 +848,23 @@ void TryAutoEntry() {
    double riskPct   = primaryReady ? PrimaryRisk : FallbackRisk;
    string strategy  = primaryReady ? "PRIMARY" : "FALLBACK";
 
+   // ── DXY CORRELATION CHECK ──
+   if(!IsDXYAligned(isBuy)) {
+      g_EntryLog = StringFormat("DXY BLOCKED: %s trade conflicts with DXY — %s",
+                                isBuy ? "BUY" : "SELL", g_DXY_Status);
+      g_AlertSent = false;
+      return;
+   }
+
+   // ── CANDLE CONFIRMATION CHECK ──
+   ENUM_TIMEFRAMES entryTF = primaryReady ? TF_M15 : TF_M5;
+   if(!CheckCandleConfirmation(isBuy, entryTF)) {
+      g_EntryLog = StringFormat("CANDLE: Waiting for confirmation on %s — %s",
+                                primaryReady ? "M15" : "M5", g_CandlePattern);
+      g_AlertSent = false;
+      return;
+   }
+
    // Avoid re-alerting same signal
    if(g_AlertSent && score == g_LastSignalScore) return;
 
@@ -943,6 +1137,8 @@ void AnalyzeAllTimeframes() {
    g_H1  = AnalyzeSMC(_Symbol, TF_H1,  "H1",  BOS_Lookback);
    g_M15 = AnalyzeSMC(_Symbol, TF_M15, "M15", BOS_Lookback);
    g_M5  = AnalyzeSMC(_Symbol, TF_M5,  "M5",  BOS_Lookback);
+
+   UpdateDXY();
 
    g_PrimaryScore   = ScorePrimaryAdvanced(g_H4, g_H1, g_M15);
    g_FallbackScore  = ScoreFallbackAdvanced(g_H1, g_M15, g_M5);
@@ -1688,7 +1884,7 @@ string TR(string label, string value) {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 84 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 96 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -1843,6 +2039,50 @@ void UpdateDashboard() {
                          g_M15.inSilverBullet ? "ACTIVE (22:00-23:00 PHT)" : "Not active",
                          g_H4.weeklyHigh, g_H4.weeklyLow),
             sbClr, FontSize);
+   y += dy + 4;
+
+   // ── DXY CORRELATION ──
+   SetLabel(PREFIX+"DH", x, y, "── DXY CORRELATION ──", ColorHeader, FontSize);
+   y += dy;
+
+   color dxyClr = !UseDXYFilter         ? ColorNeutral :
+                  !g_DXY_Available      ? ColorWarn    :
+                  g_DXY_Bullish         ? ColorBear    : ColorBull;
+   string dxyLabel = UseDXYFilter ? "" : "Filter OFF  |  ";
+   SetLabel(PREFIX+"DX1", x, y,
+            StringFormat("%sDXY (%s): %s  |  Price: %.3f  |  Change: %+.3f",
+                         dxyLabel, DXY_Symbol,
+                         g_DXY_Status, g_DXY_Price, g_DXY_Change),
+            dxyClr, FontSize);
+   y += dy;
+
+   // DXY vs Gold logic explainer
+   string dxyLogic = !g_DXY_Available ? "Check DXY symbol name in settings" :
+                     g_DXY_Bullish    ? "USD Strengthening — Favor SELL gold, block BUY" :
+                                        "USD Weakening — Favor BUY gold, block SELL";
+   SetLabel(PREFIX+"DX2", x, y, dxyLogic,
+            g_DXY_Available ? (g_DXY_Bullish ? ColorBear : ColorBull) : ColorWarn,
+            FontSize);
+   y += dy + 4;
+
+   // ── CANDLE CONFIRMATION ──
+   SetLabel(PREFIX+"CCH", x, y, "── CANDLE CONFIRMATION ──", ColorHeader, FontSize);
+   y += dy;
+
+   color ccClr = !UseCandleConfirm  ? ColorNeutral :
+                 g_CandleConfirmed  ? ColorBull    : ColorWarn;
+   string ccStatus = !UseCandleConfirm ? "Filter OFF" :
+                     g_CandleConfirmed ? "CONFIRMED" : "WAITING";
+   SetLabel(PREFIX+"CC1", x, y,
+            StringFormat("Status: %s  |  Pattern: %s  |  Required on M15 (Primary) / M5 (Fallback)",
+                         ccStatus, g_CandlePattern),
+            ccClr, FontSize);
+   y += dy;
+
+   SetLabel(PREFIX+"CC2", x, y,
+            StringFormat("Patterns accepted: Bullish/Bearish Engulf | Pin Bar (wick %.1fx body) | Strong Momentum (body >70%% range)",
+                         PinBarWickRatio),
+            ColorNeutral, FontSize);
    y += dy + 4;
 
    // ── RECOMMENDATION ──
@@ -2148,7 +2388,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v8.0 | %s | Magic: %d | %s",
+            StringFormat("v9.0 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
