@@ -1,65 +1,279 @@
 """
-XAUUSD Sniper EA — Claude AI Bridge
-====================================
-Connects MetaTrader 5 EA to Claude AI for real-time signal validation.
+XAUUSD Sniper EA — Claude AI Bridge + Telegram Bot
+====================================================
+Connects MetaTrader 5 EA to Claude AI and your Telegram phone.
 
-How it works:
-  1. EA writes a signal file when a trade setup is detected
-  2. This script reads the signal and sends it to Claude API
-  3. Claude analyzes the SMC confluence and returns a verdict
-  4. Script writes the verdict back to a response file
-  5. EA reads the verdict and executes or skips the trade
-  6. EA writes trade results so Claude can track performance
+Features:
+  - Claude AI validates every trade signal (TAKE/SKIP/ADJUST_SL)
+  - Telegram sends you alerts for signals, entries, TP/SL hits
+  - Control your EA from your phone with simple commands
+  - /status  — see balance, P&L, open trades
+  - /pause   — stop new entries remotely
+  - /resume  — resume trading
+  - /close   — close all open trades
+  - /score 35 — change minimum score threshold
+  - /risk 1.5 — change risk percentage
+  - /report  — get today's performance summary
+  - /help    — list all commands
 
 Setup:
-  pip install anthropic
-  Set your API key below or in environment variable ANTHROPIC_API_KEY
-  Set MT5_FILES_PATH to your MT5 Common Files folder
-  Run: python claude_bridge.py
-
-Cost: ~$0.005 per signal (~$0.45/month at 3 trades/day)
+  1. pip install anthropic requests
+  2. Create Telegram bot via @BotFather — get token
+  3. Set ANTHROPIC_API_KEY and TELEGRAM_TOKEN below
+  4. Run: python claude_bridge.py
+  5. Send any message to your bot to register your chat ID
+  6. In MT5 EA settings: set UseBridge=true
 """
 
 import os
 import time
+import json
+import requests
 import anthropic
 from datetime import datetime
 from pathlib import Path
 
-# ── CONFIGURATION ──────────────────────────────────────────────────
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "your-api-key-here")
+# ══════════════════════════════════════════════════════════════════
+# CONFIGURATION — edit these before running
+# ══════════════════════════════════════════════════════════════════
 
-# MT5 Common Files folder — change to match your system
-# Windows default: C:/Users/YOUR_NAME/AppData/Roaming/MetaQuotes/Terminal/Common/Files/
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "your-anthropic-key-here")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "your-telegram-bot-token-here")
+
+# Your Telegram chat ID — leave 0 to auto-detect on first message
+CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+
+# MT5 Common Files folder — update to match your Windows username
 MT5_FILES_PATH = Path(os.environ.get(
     "MT5_FILES_PATH",
     r"C:/Users/" + os.environ.get("USERNAME", "User") +
     r"/AppData/Roaming/MetaQuotes/Terminal/Common/Files"
 ))
 
+# File names (must match EA settings)
 SIGNAL_FILE   = MT5_FILES_PATH / "SNP_Signal.txt"
 RESPONSE_FILE = MT5_FILES_PATH / "SNP_Response.txt"
 RESULT_FILE   = MT5_FILES_PATH / "SNP_Result.txt"
-LOG_FILE       = Path("claude_bridge_log.txt")
+STATUS_FILE   = MT5_FILES_PATH / "SNP_Status.txt"
+COMMAND_FILE  = MT5_FILES_PATH / "SNP_Command.txt"
+SETTINGS_FILE = MT5_FILES_PATH / "SNP_Settings.txt"
+ACK_FILE      = MT5_FILES_PATH / "SNP_CmdAck.txt"
 
-POLL_INTERVAL = 1.0   # seconds between file checks
+LOG_FILE      = Path("claude_bridge_log.txt")
+STATE_FILE    = Path("bridge_state.json")  # Persists chat ID etc.
+
 MODEL         = "claude-opus-4-8"
+POLL_INTERVAL = 1.0   # seconds between file and Telegram checks
 
-# ── CLAUDE CLIENT ──────────────────────────────────────────────────
-client = anthropic.Anthropic(api_key=API_KEY)
+# ══════════════════════════════════════════════════════════════════
+# STATE
+# ══════════════════════════════════════════════════════════════════
 
-# Track performance for context
-trade_history = []   # list of dicts: {result, profit, strategy, score, session}
+state = {
+    "chat_id":        CHAT_ID,
+    "tg_offset":      0,
+    "trade_history":  [],
+    "last_briefing":  -1,
+    "paused":         False,
+}
 
+def load_state():
+    global state
+    if STATE_FILE.exists():
+        try:
+            saved = json.loads(STATE_FILE.read_text())
+            state.update(saved)
+        except Exception:
+            pass
+    if CHAT_ID != 0:
+        state["chat_id"] = CHAT_ID
+
+def save_state():
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ══════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════
 
 def log(msg: str):
-    """Write timestamped message to log and console."""
-    ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
+
+# ══════════════════════════════════════════════════════════════════
+# TELEGRAM FUNCTIONS
+# ══════════════════════════════════════════════════════════════════
+
+TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+def tg_send(text: str, parse_mode: str = "HTML") -> bool:
+    """Send message to Telegram."""
+    if not state["chat_id"]:
+        log(f"No chat_id yet — message not sent: {text[:60]}")
+        return False
+    try:
+        r = requests.post(
+            f"{TG_BASE}/sendMessage",
+            data={"chat_id": state["chat_id"],
+                  "text": text,
+                  "parse_mode": parse_mode},
+            timeout=10
+        )
+        return r.status_code == 200
+    except Exception as e:
+        log(f"Telegram send error: {e}")
+        return False
+
+
+def tg_get_updates() -> list:
+    """Poll Telegram for new messages."""
+    try:
+        r = requests.get(
+            f"{TG_BASE}/getUpdates",
+            params={"offset": state["tg_offset"], "timeout": 1},
+            timeout=5
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if not data.get("ok"):
+            return []
+        return data.get("result", [])
+    except Exception:
+        return []
+
+
+def tg_process_updates():
+    """Read and process all new Telegram messages."""
+    updates = tg_get_updates()
+    for upd in updates:
+        state["tg_offset"] = upd["update_id"] + 1
+
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+
+        # Auto-register first user's chat ID
+        chat_id = msg["chat"]["id"]
+        if not state["chat_id"]:
+            state["chat_id"] = chat_id
+            save_state()
+            log(f"Chat ID registered: {chat_id}")
+            tg_send("✅ <b>Bridge connected!</b>\nSend /help to see all commands.")
+            continue
+
+        # Only accept messages from registered user
+        if chat_id != state["chat_id"]:
+            continue
+
+        text = msg.get("text", "").strip().lower()
+        handle_command(text)
+
+    save_state()
+
+
+def handle_command(text: str):
+    """Process a command from Telegram."""
+    log(f"Telegram command: {text}")
+
+    # /help
+    if text in ("/help", "help"):
+        tg_send(
+            "📋 <b>XAUUSD Sniper Commands</b>\n\n"
+            "/status — Account balance, P&L, open trades\n"
+            "/signal — Latest signal details\n"
+            "/report — Today's performance summary\n"
+            "/pause  — Stop new trade entries\n"
+            "/resume — Resume trading\n"
+            "/close  — Close all open trades\n"
+            "/score 35 — Set min primary score (5-20)\n"
+            "/risk 1.5 — Set primary risk % (0.5-5.0)\n"
+            "/fscore 9 — Set min fallback score\n"
+            "/help   — Show this list"
+        )
+
+    # /status
+    elif text in ("/status", "status"):
+        send_status()
+
+    # /signal
+    elif text in ("/signal", "signal"):
+        send_latest_signal()
+
+    # /report
+    elif text in ("/report", "report"):
+        send_report()
+
+    # /pause
+    elif text in ("/pause", "pause"):
+        write_command("PAUSE", "")
+        state["paused"] = True
+        tg_send("⏸ <b>Trading PAUSED</b>\nNo new entries until you send /resume")
+
+    # /resume
+    elif text in ("/resume", "resume"):
+        write_command("RESUME", "")
+        state["paused"] = False
+        tg_send("▶️ <b>Trading RESUMED</b>")
+
+    # /close
+    elif text in ("/close", "close all", "/close all"):
+        write_command("CLOSE_ALL", "Manual close via Telegram")
+        tg_send("🔴 <b>Closing all trades...</b>\nConfirmation will arrive shortly.")
+
+    # /score N
+    elif text.startswith("/score") or text.startswith("score "):
+        parts = text.split()
+        if len(parts) >= 2 and parts[-1].isdigit():
+            val = int(parts[-1])
+            if 5 <= val <= 20:
+                write_command("SET_PRIMARY_SCORE", str(val))
+                tg_send(f"✅ <b>Min primary score set to {val}</b>")
+            else:
+                tg_send("❌ Score must be between 5 and 20")
+        else:
+            tg_send("Usage: /score 35")
+
+    # /fscore N
+    elif text.startswith("/fscore") or text.startswith("fscore "):
+        parts = text.split()
+        if len(parts) >= 2 and parts[-1].isdigit():
+            val = int(parts[-1])
+            if 5 <= val <= 22:
+                write_command("SET_FALLBACK_SCORE", str(val))
+                tg_send(f"✅ <b>Min fallback score set to {val}</b>")
+            else:
+                tg_send("❌ Fallback score must be between 5 and 22")
+        else:
+            tg_send("Usage: /fscore 9")
+
+    # /risk N
+    elif text.startswith("/risk") or text.startswith("risk "):
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                val = float(parts[-1])
+                if 0.1 <= val <= 10.0:
+                    write_settings({"PrimaryRisk": str(val)})
+                    tg_send(f"✅ <b>Primary risk set to {val}%</b>")
+                else:
+                    tg_send("❌ Risk must be between 0.1 and 10.0")
+            except ValueError:
+                tg_send("Usage: /risk 1.5")
+        else:
+            tg_send("Usage: /risk 1.5")
+
+    else:
+        tg_send("❓ Unknown command. Send /help")
+
+
+# ══════════════════════════════════════════════════════════════════
+# STATUS & REPORT MESSAGES
+# ══════════════════════════════════════════════════════════════════
 
 def parse_file(path: Path) -> dict:
     """Parse key=value file into dict."""
@@ -76,247 +290,370 @@ def parse_file(path: Path) -> dict:
     return data
 
 
-def write_response(verdict: str, reason: str, adjust_sl: str = ""):
-    """Write Claude verdict back to MT5."""
-    with open(RESPONSE_FILE, "w", encoding="utf-8") as f:
-        f.write(f"VERDICT={verdict}\n")
-        f.write(f"REASON={reason}\n")
-        if adjust_sl:
-            f.write(f"ADJUST_SL={adjust_sl}\n")
-    log(f"Response written: {verdict} — {reason}")
+def send_status():
+    """Read SNP_Status.txt and send formatted status to Telegram."""
+    if not STATUS_FILE.exists():
+        tg_send("❌ No status file yet — is the EA running?")
+        return
+
+    s = parse_file(STATUS_FILE)
+    balance  = s.get("balance",      "?")
+    equity   = s.get("equity",       "?")
+    dpnl     = s.get("daily_pnl",    "?")
+    wpnl     = s.get("weekly_pnl",   "?")
+    dd       = s.get("drawdown",     "?")
+    trades   = s.get("open_trades",  "?")
+    session  = s.get("session",      "?")
+    gate     = s.get("gate",         "?")
+    paused   = s.get("paused",       "false")
+    pscore   = s.get("primary_score","?")
+    fscore   = s.get("fallback_score","?")
+    pthr     = s.get("prim_threshold","?")
+    fthr     = s.get("fall_threshold","?")
+    news     = s.get("news",         "?")
+    dxy      = s.get("dxy",          "?")
+    wr       = s.get("win_rate",     "?")
+    pf       = s.get("profit_factor","?")
+    rec      = s.get("recommendation","?")
+    t_time   = s.get("time",         "?")
+
+    gate_icon = "🟢" if gate == "OPEN"  else "🔴"
+    paus_icon = "⏸" if paused == "true" else ""
+    dpnl_icon = "📈" if dpnl.startswith("+") else "📉"
+
+    msg = (
+        f"📊 <b>XAUUSD Sniper Status</b>  {t_time}\n"
+        f"{'─'*30}\n"
+        f"💰 Balance:  <b>${balance}</b>   Equity: ${equity}\n"
+        f"{dpnl_icon} Daily P&L: <b>{dpnl}%</b>   Weekly: {wpnl}%\n"
+        f"📉 Drawdown: {dd}%\n"
+        f"{'─'*30}\n"
+        f"{gate_icon} Gate: <b>{gate}</b> {paus_icon}\n"
+        f"📰 News: {news}   DXY: {dxy[:30]}\n"
+        f"{'─'*30}\n"
+        f"🎯 Primary Score: {pscore}/42 (need {pthr})\n"
+        f"🎯 Fallback Score:{fscore}/42 (need {fthr})\n"
+        f"📂 Open trades: {trades}\n"
+        f"{'─'*30}\n"
+        f"📈 Win Rate: {wr}%   PF: {pf}\n"
+        f"💡 {rec[:80]}\n"
+    )
+
+    # Add open trade details
+    for i in range(3):
+        td = s.get(f"trade_{i}", "")
+        if td:
+            msg += f"\n🔷 {td}"
+
+    tg_send(msg)
 
 
-def build_signal_prompt(sig: dict) -> str:
-    """Build the prompt sent to Claude for signal analysis."""
+def send_latest_signal():
+    """Send the last known signal from trade history."""
+    if not state["trade_history"]:
+        tg_send("No signals recorded yet this session.")
+        return
+    last = state["trade_history"][-1]
+    tg_send(
+        f"📡 <b>Last Signal</b>\n"
+        f"Result: {last.get('result','?')}  ${last.get('profit','?')}\n"
+        f"Strategy: {last.get('strategy','?')}  Score: {last.get('score','?')}\n"
+        f"Session: {last.get('session','?')}\n"
+        f"Time: {last.get('time','?')}"
+    )
 
-    # Build recent performance context
-    perf_ctx = ""
-    if trade_history:
-        recent = trade_history[-10:]
-        wins   = sum(1 for t in recent if t["result"] == "WIN")
-        perf_ctx = (
-            f"\nRECENT PERFORMANCE (last {len(recent)} trades): "
-            f"{wins}/{len(recent)} wins ({wins/len(recent)*100:.0f}% win rate)\n"
-        )
-        if len(recent) >= 3:
-            last3 = recent[-3:]
-            perf_ctx += "Last 3: " + " | ".join(
-                f"{t['result']} ${t['profit']}" for t in last3
-            ) + "\n"
+
+def send_report():
+    """Send today's performance summary."""
+    history = state["trade_history"]
+    if not history:
+        tg_send("📋 No trades recorded yet.")
+        return
+
+    total   = len(history)
+    wins    = sum(1 for t in history if t.get("result") == "WIN")
+    profits = [float(t["profit"]) for t in history if t.get("profit","?") != "?"]
+    net     = sum(profits)
+    wr      = wins / total * 100 if total else 0
+
+    msg = (
+        f"📋 <b>Session Report</b>\n"
+        f"{'─'*25}\n"
+        f"Total trades: {total}\n"
+        f"Wins: {wins}   Losses: {total-wins}\n"
+        f"Win Rate: {wr:.1f}%\n"
+        f"Net P&L: {'+'if net>=0 else ''}${net:.2f}\n"
+    )
+
+    if profits:
+        msg += f"Best: +${max(profits):.2f}   Worst: ${min(profits):.2f}\n"
+
+    recent = history[-5:]
+    msg += f"\nLast {len(recent)} trades: "
+    msg += " ".join("✓" if t.get("result")=="WIN" else "✗" for t in recent)
+
+    tg_send(msg)
+
+
+# ══════════════════════════════════════════════════════════════════
+# FILE COMMUNICATION
+# ══════════════════════════════════════════════════════════════════
+
+def write_command(cmd: str, arg: str):
+    """Write command file for EA to execute."""
+    try:
+        with open(COMMAND_FILE, "w", encoding="utf-8") as f:
+            f.write(f"CMD={cmd}\nARG={arg}\n")
+        log(f"Command written: {cmd} {arg}")
+    except Exception as e:
+        log(f"Error writing command: {e}")
+
+
+def write_settings(settings: dict):
+    """Write settings override file for EA to apply."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            for k, v in settings.items():
+                f.write(f"{k}={v}\n")
+        log(f"Settings written: {settings}")
+    except Exception as e:
+        log(f"Error writing settings: {e}")
+
+
+def check_ack():
+    """Check if EA acknowledged a command and notify Telegram."""
+    if not ACK_FILE.exists():
+        return
+    data = parse_file(ACK_FILE)
+    try:
+        ACK_FILE.unlink()
+    except Exception:
+        pass
+    if data.get("RESULT"):
+        tg_send(f"✅ EA confirmed: {data['RESULT']}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# CLAUDE AI SIGNAL ANALYSIS
+# ══════════════════════════════════════════════════════════════════
+
+ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def build_prompt(sig: dict) -> str:
+    perf = ""
+    h    = state["trade_history"]
+    if h:
+        recent = h[-10:]
+        wins   = sum(1 for t in recent if t.get("result") == "WIN")
+        perf   = (f"\nRECENT: {wins}/{len(recent)} wins "
+                  f"({wins/len(recent)*100:.0f}%) — "
+                  f"last 3: {[t.get('result','?') for t in recent[-3:]]}")
 
     return f"""You are an expert SMC/ICT gold trader reviewing a XAUUSD trade signal.
+Analyze and respond with TAKE, SKIP, or ADJUST_SL.
 
-Analyze this setup and respond with TAKE, SKIP, or ADJUST_SL.
+SIGNAL: {sig.get('direction','?')} | Strategy: {sig.get('strategy','?')} | Score: {sig.get('score','?')} | Session: {sig.get('session','?')}
 
-━━━ SIGNAL DETAILS ━━━
-Time:      {sig.get('time', 'N/A')}
-Strategy:  {sig.get('strategy', 'N/A')}
-Direction: {sig.get('direction', 'N/A')}
-Score:     {sig.get('score', 'N/A')}
-Session:   {sig.get('session', 'N/A')}
+H4: Bias={sig.get('h4_bias','?')} ExtBOS={sig.get('h4_extbos','?')} MSS={sig.get('h4_mss','?')} FreshOB={sig.get('h4_freshob','?')} Zone={sig.get('h4_zone','?')} AtSR={sig.get('h4_atsr','?')}
+H1: Bias={sig.get('h1_bias','?')} CHoCH={sig.get('h1_choch','?')} MSS={sig.get('h1_mss','?')} FreshOB={sig.get('h1_freshob','?')} FVG={sig.get('h1_fvgopen','?')} OTE={sig.get('h1_ote','?')} Sweep={sig.get('h1_sweep','?')}
+M15: Bias={sig.get('m15_bias','?')} Sweep={sig.get('m15_sweep','?')} CHoCH={sig.get('m15_choch','?')} FreshOB={sig.get('m15_freshob','?')} Judas={sig.get('m15_judas','?')} Silver={sig.get('m15_silver','?')}
+DXY: {sig.get('dxy_status','?')} | Candle: {sig.get('candle','?')} | News: {sig.get('news','?')}
 
-━━━ H4 STRUCTURE (Bias) ━━━
-Bias:          {sig.get('h4_bias', 'N/A')}
-External BOS:  {sig.get('h4_extbos', 'N/A')}
-MSS:           {sig.get('h4_mss', 'N/A')}
-Fresh OB:      {sig.get('h4_freshob', 'N/A')} ({sig.get('h4_ob_status', '')})
-At Key S/R:    {sig.get('h4_atsr', 'N/A')}
-Zone:          {sig.get('h4_zone', 'N/A')}
-Weekly H/L:    {sig.get('h4_weekly', 'N/A')}
+Entry={sig.get('entry','?')} SL={sig.get('sl','?')} ({sig.get('sl_pips','?')}pips) TP2={sig.get('tp2','?')} RR={sig.get('rr','?')}
+Balance=${sig.get('balance','?')} DailyPnL={sig.get('daily_pnl','?')} Drawdown={sig.get('drawdown','?')}
+{perf}
 
-━━━ H1 ZONE ━━━
-Bias:          {sig.get('h1_bias', 'N/A')}
-CHoCH:         {sig.get('h1_choch', 'N/A')}
-MSS:           {sig.get('h1_mss', 'N/A')}
-Fresh OB:      {sig.get('h1_freshob', 'N/A')}
-Open FVG:      {sig.get('h1_fvgopen', 'N/A')}
-OTE (61-79%):  {sig.get('h1_ote', 'N/A')}
-Sweep:         {sig.get('h1_sweep', 'N/A')}
-Displacement:  {sig.get('h1_displacement', 'N/A')}
-
-━━━ M15 ENTRY TRIGGER ━━━
-Bias:          {sig.get('m15_bias', 'N/A')}
-Sweep:         {sig.get('m15_sweep', 'N/A')}
-CHoCH:         {sig.get('m15_choch', 'N/A')}
-MSS:           {sig.get('m15_mss', 'N/A')}
-Fresh OB:      {sig.get('m15_freshob', 'N/A')}
-Open FVG:      {sig.get('m15_fvgopen', 'N/A')}
-Judas Swing:   {sig.get('m15_judas', 'N/A')}
-Silver Bullet: {sig.get('m15_silver', 'N/A')}
-
-━━━ FILTERS ━━━
-DXY:           {sig.get('dxy_status', 'N/A')}
-Candle:        {sig.get('candle', 'N/A')}
-News:          {sig.get('news', 'N/A')}
-
-━━━ TRADE LEVELS ━━━
-Entry:   {sig.get('entry', 'N/A')}
-SL:      {sig.get('sl', 'N/A')} ({sig.get('sl_pips', '?')} pips)
-TP1:     {sig.get('tp1', 'N/A')}
-TP2:     {sig.get('tp2', 'N/A')} (RR {sig.get('rr', '?')})
-Lots:    {sig.get('lots', 'N/A')}
-Risk:    {sig.get('risk_pct', 'N/A')}%
-
-━━━ ACCOUNT ━━━
-Balance:     ${sig.get('balance', 'N/A')}
-Equity:      ${sig.get('equity', 'N/A')}
-Daily P&L:   {sig.get('daily_pnl', 'N/A')}
-Daily trades:{sig.get('daily_trades', 'N/A')}
-Drawdown:    {sig.get('drawdown', 'N/A')}
-{perf_ctx}
-━━━ YOUR RESPONSE FORMAT (strict) ━━━
-Reply with EXACTLY these lines — nothing else:
-
-VERDICT=TAKE
-REASON=One sentence explanation
-
-or:
-
-VERDICT=SKIP
-REASON=One sentence explanation
-
-or (if SL should be at a better level):
-
-VERDICT=ADJUST_SL
-ADJUST_SL=<price>
-REASON=One sentence explanation
-
-Rules:
-- TAKE if HTF bias matches direction AND LTF has clear sweep+CHoCH trigger
-- SKIP if H4/H1 bias conflict OR OB is mitigated OR score is marginal
-- ADJUST_SL if a stronger structural level exists nearby for better RR
-- Be decisive — one clear verdict, one short reason
-"""
+Reply EXACTLY:
+VERDICT=TAKE or SKIP or ADJUST_SL
+REASON=one sentence
+ADJUST_SL=price (only if ADJUST_SL verdict)"""
 
 
 def analyze_signal(sig: dict):
-    """Send signal to Claude and write response."""
-    log(f"Analyzing {sig.get('direction','?')} signal — score {sig.get('score','?')}")
-
-    prompt = build_signal_prompt(sig)
-
+    log(f"Sending to Claude: {sig.get('direction','?')} score {sig.get('score','?')}")
     try:
-        message = client.messages.create(
+        msg = ai_client.messages.create(
             model=MODEL,
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}]
+            max_tokens=120,
+            messages=[{"role": "user", "content": build_prompt(sig)}]
         )
-        response_text = message.content[0].text.strip()
-        log(f"Claude raw response:\n{response_text}")
+        raw = msg.content[0].text.strip()
+        log(f"Claude: {raw}")
 
-        # Parse response
-        lines   = {k: v for k, v in
-                   (line.split("=", 1) for line in response_text.splitlines()
-                    if "=" in line)}
-        verdict   = lines.get("VERDICT",    "SKIP")
-        reason    = lines.get("REASON",     "No reason provided")
-        adjust_sl = lines.get("ADJUST_SL",  "")
+        lines     = {k: v for k, v in
+                     (line.split("=", 1) for line in raw.splitlines() if "=" in line)}
+        verdict   = lines.get("VERDICT",   "SKIP")
+        reason    = lines.get("REASON",    "No reason")
+        adjust_sl = lines.get("ADJUST_SL", "")
 
-        # Validate verdict
         if verdict not in ("TAKE", "SKIP", "ADJUST_SL"):
             verdict = "SKIP"
-            reason  = "Invalid Claude response — defaulting to SKIP"
+            reason  = "Invalid response — defaulting to SKIP"
 
-        write_response(verdict, reason, adjust_sl)
+        # Write verdict for EA
+        with open(RESPONSE_FILE, "w", encoding="utf-8") as f:
+            f.write(f"VERDICT={verdict}\nREASON={reason}\n")
+            if adjust_sl:
+                f.write(f"ADJUST_SL={adjust_sl}\n")
+
+        # Notify Telegram
+        icon   = "✅" if verdict == "TAKE" else "❌" if verdict == "SKIP" else "🔧"
+        direct = sig.get("direction", "?")
+        score  = sig.get("score",     "?")
+        entry  = sig.get("entry",     "?")
+        sl     = sig.get("sl",        "?")
+        tp2    = sig.get("tp2",       "?")
+        sess   = sig.get("session",   "?")
+
+        tg_msg = (
+            f"{icon} <b>Claude: {verdict}</b>\n"
+            f"{'─'*25}\n"
+            f"Signal: <b>{direct}</b> | Score: {score}\n"
+            f"Session: {sess}\n"
+            f"Entry: {entry}  SL: {sl}  TP2: {tp2}\n"
+        )
+        if adjust_sl:
+            tg_msg += f"Adjusted SL: {adjust_sl}\n"
+        tg_msg += f"\n💬 {reason}"
+        tg_send(tg_msg)
 
     except Exception as e:
         log(f"Claude API error: {e}")
-        write_response("SKIP", f"API error: {str(e)[:80]}")
+        with open(RESPONSE_FILE, "w", encoding="utf-8") as f:
+            f.write(f"VERDICT=SKIP\nREASON=API error: {str(e)[:60]}\n")
 
+
+# ══════════════════════════════════════════════════════════════════
+# TRADE RESULT PROCESSING
+# ══════════════════════════════════════════════════════════════════
 
 def process_result(res: dict):
-    """Process trade result — store for context and log."""
-    entry = {
-        "result":   res.get("result",   "?"),
-        "profit":   res.get("profit",   "?"),
-        "strategy": res.get("strategy", "?"),
-        "score":    res.get("score",    "?"),
-        "session":  res.get("session",  "?"),
-        "time":     res.get("time",     "?"),
-    }
-    trade_history.append(entry)
-    # Keep last 50
-    if len(trade_history) > 50:
-        trade_history.pop(0)
+    result   = res.get("result",   "?")
+    profit   = res.get("profit",   "?")
+    strategy = res.get("strategy", "?")
+    score    = res.get("score",    "?")
+    session  = res.get("session",  "?")
+    t_time   = res.get("time",     "?")
 
-    icon = "✓" if entry["result"] == "WIN" else "✗"
-    log(f"Trade result: {icon} {entry['result']} ${entry['profit']} "
-        f"| {entry['strategy']} score:{entry['score']} | {entry['session']}")
+    state["trade_history"].append({
+        "result": result, "profit": profit,
+        "strategy": strategy, "score": score,
+        "session": session, "time": t_time
+    })
+    if len(state["trade_history"]) > 50:
+        state["trade_history"].pop(0)
+    save_state()
 
+    icon   = "🏆" if result == "WIN" else "💔"
+    profit_str = f"+${profit}" if result == "WIN" else f"-${abs(float(profit)):.2f}" if profit != "?" else profit
+
+    tg_send(
+        f"{icon} <b>Trade {result}</b>\n"
+        f"{'─'*25}\n"
+        f"P&L: <b>{profit_str}</b>\n"
+        f"Strategy: {strategy}  Score: {score}\n"
+        f"Session: {session}"
+    )
+    log(f"Result: {result} ${profit} | {strategy} | {session}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# DAILY BRIEFING
+# ══════════════════════════════════════════════════════════════════
 
 def daily_briefing():
-    """Generate a morning briefing — call once per day if desired."""
-    if not trade_history:
+    h = state["trade_history"]
+    if not h:
+        tg_send("☀️ <b>Good morning!</b>\nNo trade history yet. Ready to trade.")
         return
-    wins   = sum(1 for t in trade_history if t["result"] == "WIN")
-    total  = len(trade_history)
-    profit = sum(float(t["profit"]) for t in trade_history
-                 if t["profit"] not in ("?", ""))
+    wins    = sum(1 for t in h if t.get("result") == "WIN")
+    total   = len(h)
+    profits = [float(t["profit"]) for t in h if t.get("profit", "?") != "?"]
+    net     = sum(profits)
 
     try:
-        message = client.messages.create(
+        msg = ai_client.messages.create(
             model=MODEL,
-            max_tokens=300,
+            max_tokens=200,
             messages=[{"role": "user", "content":
-                f"""You are an XAUUSD SMC trading coach.
-
-Give a 3-sentence daily briefing based on these stats:
-Total trades: {total}
-Win rate: {wins/total*100:.1f}% ({wins}/{total})
-Net profit: ${profit:.2f}
-Recent 5: {[t['result'] for t in trade_history[-5:]]}
-
-Focus on: what is working, what to watch for, one adjustment suggestion.
-Keep it under 3 sentences."""
+                f"""XAUUSD SMC trading coach. Give a 3-sentence morning briefing.
+Stats: {total} trades, {wins/total*100:.0f}% win rate, net ${net:.2f}
+Recent results: {[t.get('result') for t in h[-5:]]}
+Sessions: {set(t.get('session','') for t in h[-10:])}
+Focus on: what is working, what to watch, one improvement tip.
+Keep it under 3 sentences. Be direct and practical."""
             }]
         )
-        briefing = message.content[0].text.strip()
-        log(f"\n{'='*60}\nDAILY BRIEFING:\n{briefing}\n{'='*60}")
-    except Exception as e:
-        log(f"Briefing error: {e}")
+        briefing = msg.content[0].text.strip()
+    except Exception:
+        briefing = f"Win rate: {wins/total*100:.0f}% over {total} trades. Net P&L: ${net:.2f}. Trade with discipline today."
 
+    tg_send(
+        f"☀️ <b>Good Morning — Daily Briefing</b>\n"
+        f"{'─'*25}\n"
+        f"{briefing}\n\n"
+        f"Stats: {wins}/{total} wins ({wins/total*100:.0f}%)  Net: ${net:.2f}\n"
+        f"Send /status for live account data."
+    )
+    log("Daily briefing sent")
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ══════════════════════════════════════════════════════════════════
 
 def main():
+    load_state()
+
     log("=" * 60)
-    log("XAUUSD Sniper — Claude AI Bridge STARTED")
-    log(f"Watching: {MT5_FILES_PATH}")
-    log(f"Signal:   {SIGNAL_FILE.name}")
-    log(f"Response: {RESPONSE_FILE.name}")
-    log(f"Model:    {MODEL}")
+    log("XAUUSD Sniper — Claude AI Bridge + Telegram Bot STARTED")
+    log(f"MT5 Files: {MT5_FILES_PATH}")
+    log(f"Model:     {MODEL}")
+    log(f"Chat ID:   {state['chat_id'] or 'not set — send any message to bot'}")
     log("=" * 60)
 
-    # Verify API key
-    if API_KEY == "your-api-key-here":
-        log("ERROR: Set your Anthropic API key in API_KEY or ANTHROPIC_API_KEY env var")
+    # Validate API keys
+    if ANTHROPIC_API_KEY == "your-anthropic-key-here":
+        log("ERROR: Set ANTHROPIC_API_KEY")
+        return
+    if TELEGRAM_TOKEN == "your-telegram-bot-token-here":
+        log("ERROR: Set TELEGRAM_TOKEN")
         return
 
-    # Verify MT5 files path exists
     if not MT5_FILES_PATH.exists():
-        log(f"WARNING: MT5 files path not found: {MT5_FILES_PATH}")
-        log("Create the directory or update MT5_FILES_PATH in this script")
+        log(f"WARNING: MT5 path not found: {MT5_FILES_PATH}")
 
-    last_briefing_day = -1
+    # Startup message to Telegram
+    if state["chat_id"]:
+        tg_send(
+            "🟢 <b>XAUUSD Sniper Bridge ONLINE</b>\n"
+            "Claude AI + Telegram monitoring active.\n"
+            "Send /help to see all commands."
+        )
+
+    last_briefing_day = state.get("last_briefing", -1)
 
     while True:
         try:
             now = datetime.now()
 
-            # Daily briefing at 8:00 AM (before London open)
+            # Daily briefing at 8:00 AM PHT (before London open 15:00 PHT)
             if now.hour == 8 and now.day != last_briefing_day:
-                last_briefing_day = now.day
+                last_briefing_day      = now.day
+                state["last_briefing"] = now.day
                 daily_briefing()
+                save_state()
 
-            # Check for new signal
+            # Check for MT5 signal
             if SIGNAL_FILE.exists():
                 sig = parse_file(SIGNAL_FILE)
-                if sig.get("time") and "END_SIGNAL" not in sig:
-                    # File still being written — wait
-                    time.sleep(0.2)
+                if sig and "END_SIGNAL" not in str(sig.get("time","")):
+                    time.sleep(0.1)  # Let EA finish writing
                     sig = parse_file(SIGNAL_FILE)
-
                 if sig:
                     try:
-                        SIGNAL_FILE.unlink()  # Delete signal file
+                        SIGNAL_FILE.unlink()
                     except Exception:
                         pass
                     analyze_signal(sig)
@@ -331,11 +668,19 @@ def main():
                         pass
                     process_result(res)
 
+            # Check for EA command acknowledgement
+            check_ack()
+
+            # Poll Telegram for commands
+            tg_process_updates()
+
         except KeyboardInterrupt:
-            log("Bridge stopped by user")
+            log("Bridge stopped")
+            if state["chat_id"]:
+                tg_send("🔴 <b>Bridge OFFLINE</b>\nRestart claude_bridge.py to reconnect.")
             break
         except Exception as e:
-            log(f"Unexpected error: {e}")
+            log(f"Error: {e}")
 
         time.sleep(POLL_INTERVAL)
 

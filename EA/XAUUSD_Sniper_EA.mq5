@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "12.00"
-#property description "XAUUSD Sniper EA — Claude AI Bridge v12.0"
+#property version     "13.00"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -308,6 +308,12 @@ int    g_PrimaryWins      = 0;
 int    g_FallbackWins     = 0;
 int    g_BatchTradeCount  = 0;   // Counts toward next adjustment cycle
 string g_LearnStatus      = "Learning: accumulating trades...";
+
+//--- Telegram / Remote control state
+bool       g_TradingPaused     = false;  // Remote pause via Telegram command
+string     g_LastTelegramMsg   = "";     // Last message sent to Telegram
+datetime   g_LastStatusWrite   = 0;      // Throttle status file writes
+string     g_RemoteChangeLog   = "";     // Log of remote parameter changes
 
 //--- Claude AI Bridge state
 enum BridgeState { BRIDGE_IDLE=0, BRIDGE_WAITING=1, BRIDGE_APPROVED=2, BRIDGE_REJECTED=3 };
@@ -821,6 +827,11 @@ double CalcLotSize(double riskPercent, double slPips) {
 //| Master gate — is trading allowed right now?                    |
 //+------------------------------------------------------------------+
 bool IsTradingAllowed() {
+   // Remote pause via Telegram
+   if(g_TradingPaused) {
+      g_BlockReason = "PAUSED remotely via Telegram — send /resume to restart";
+      return false;
+   }
    // Drawdown
    if(g_DrawdownHit) {
       g_BlockReason = StringFormat("Max drawdown hit: %.2f%% — Account protection active", g_CurrentDrawdown);
@@ -921,6 +932,13 @@ void OnDeinit(const int reason) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
+   // Remote control — read Telegram commands and setting overrides
+   if(!g_IsTesting) {
+      ReadCommandFile();
+      ReadSettingsOverride();
+      WriteStatusFile();
+   }
+
    CheckNewDay();
    CheckNewWeek();
    CheckNewMonth();
@@ -1443,6 +1461,154 @@ string GetSession() {
    if(pht >= 20 && pht < 22)  return "New York Open — TRADE WINDOW 2 (BEST)";
    if(pht >= 22)               return "After Hours — Close Charts & Rest";
    return "Pre-Market — Prepare Charts";
+}
+
+//+------------------------------------------------------------------+
+//| TELEGRAM REMOTE CONTROL FUNCTIONS                               |
+//+------------------------------------------------------------------+
+
+//--- Read command file — Telegram bot writes commands here
+void ReadCommandFile() {
+   string cmdFile = "SNP_Command.txt";
+   if(!FileIsExist(cmdFile, FILE_COMMON)) return;
+
+   int fh = FileOpen(cmdFile, FILE_READ|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+
+   string cmd = "";
+   string arg = "";
+   while(!FileIsEnding(fh)) {
+      string line = FileReadString(fh);
+      if(StringFind(line, "CMD=")    == 0) cmd = StringSubstr(line, 4);
+      if(StringFind(line, "ARG=")    == 0) arg = StringSubstr(line, 4);
+   }
+   FileClose(fh);
+   FileDelete(cmdFile, FILE_COMMON);
+
+   if(cmd == "") return;
+
+   // Execute command
+   if(cmd == "CLOSE_ALL") {
+      CloseAllTrades("Telegram command: " + arg);
+      g_RemoteChangeLog = "Closed all trades via Telegram";
+   }
+   else if(cmd == "PAUSE") {
+      g_TradingPaused   = true;
+      g_RemoteChangeLog = "Trading PAUSED via Telegram";
+   }
+   else if(cmd == "RESUME") {
+      g_TradingPaused   = false;
+      g_RemoteChangeLog = "Trading RESUMED via Telegram";
+   }
+   else if(cmd == "SET_PRIMARY_SCORE") {
+      int val = (int)StringToInteger(arg);
+      if(val >= 5 && val <= 20) {
+         g_DynPrimaryScore = val;
+         g_RemoteChangeLog = StringFormat("MinPrimaryScore set to %d via Telegram", val);
+      }
+   }
+   else if(cmd == "SET_FALLBACK_SCORE") {
+      int val = (int)StringToInteger(arg);
+      if(val >= 5 && val <= 22) {
+         g_DynFallbackScore = val;
+         g_RemoteChangeLog = StringFormat("MinFallbackScore set to %d via Telegram", val);
+      }
+   }
+   else if(cmd == "SAVE_LEARNING") {
+      SaveLearningData();
+      g_RemoteChangeLog = "Learning data saved via Telegram";
+   }
+
+   // Write acknowledgement file for Telegram bot to confirm
+   int af = FileOpen("SNP_CmdAck.txt", FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(af != INVALID_HANDLE) {
+      FileWriteString(af, StringFormat("ACK=%s\nRESULT=%s\n", cmd, g_RemoteChangeLog));
+      FileClose(af);
+   }
+}
+
+//--- Read settings override file — Telegram bot writes parameter changes
+void ReadSettingsOverride() {
+   string setFile = "SNP_Settings.txt";
+   if(!FileIsExist(setFile, FILE_COMMON)) return;
+
+   int fh = FileOpen(setFile, FILE_READ|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+
+   string changes = "";
+   while(!FileIsEnding(fh)) {
+      string line = FileReadString(fh);
+      string parts[];
+      if(StringSplit(line, '=', parts) < 2) continue;
+      string key = parts[0];
+      string val = parts[1];
+
+      if(key == "MinPrimaryScore")  { g_DynPrimaryScore  = (int)StringToInteger(val); changes += "PrimaryScore=" + val + " "; }
+      if(key == "MinFallbackScore") { g_DynFallbackScore = (int)StringToInteger(val); changes += "FallbackScore=" + val + " "; }
+      if(key == "TradingPaused")    { g_TradingPaused    = (val == "true");            changes += "Paused=" + val + " "; }
+   }
+   FileClose(fh);
+   FileDelete(setFile, FILE_COMMON);
+
+   if(changes != "")
+      g_RemoteChangeLog = "Settings updated: " + changes;
+}
+
+//--- Write status file every 30 seconds — Telegram bot reads this for /status
+void WriteStatusFile() {
+   if(TimeCurrent() - g_LastStatusWrite < 30) return;
+   g_LastStatusWrite = TimeCurrent();
+
+   int fh = FileOpen("SNP_Status.txt", FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int phtH = (dt.hour + 8) % 24;
+
+   FileWriteString(fh, StringFormat("time=%02d:%02d PHT\n", phtH, dt.min));
+   FileWriteString(fh, StringFormat("balance=%.2f\n",    AccountInfoDouble(ACCOUNT_BALANCE)));
+   FileWriteString(fh, StringFormat("equity=%.2f\n",     AccountInfoDouble(ACCOUNT_EQUITY)));
+   FileWriteString(fh, StringFormat("daily_pnl=%+.2f\n", g_DailyPnL));
+   FileWriteString(fh, StringFormat("weekly_pnl=%+.2f\n",g_WeeklyPnL));
+   FileWriteString(fh, StringFormat("drawdown=%.2f\n",   g_CurrentDrawdown));
+   FileWriteString(fh, StringFormat("open_trades=%d\n",  CountOpenTrades()));
+   FileWriteString(fh, StringFormat("daily_trades=%d/%d\n", g_DailyTradeCount, MaxDailyTrades));
+   FileWriteString(fh, StringFormat("session=%s\n",      g_Session));
+   FileWriteString(fh, StringFormat("primary_score=%d\n",g_PrimaryScore));
+   FileWriteString(fh, StringFormat("fallback_score=%d\n",g_FallbackScore));
+   FileWriteString(fh, StringFormat("paused=%s\n",       g_TradingPaused ? "true" : "false"));
+   FileWriteString(fh, StringFormat("gate=%s\n",         IsTradingAllowed() ? "OPEN" : "CLOSED"));
+   FileWriteString(fh, StringFormat("block_reason=%s\n", g_BlockReason));
+   FileWriteString(fh, StringFormat("news=%s\n",         g_NewsBlocked ? "BLOCKED" : "Clear"));
+   FileWriteString(fh, StringFormat("dxy=%s\n",          g_DXY_Status));
+   FileWriteString(fh, StringFormat("recommendation=%s\n", g_Recommendation));
+   FileWriteString(fh, StringFormat("total_trades=%d\n", g_TotalTrades));
+   FileWriteString(fh, StringFormat("win_rate=%.1f\n",   GetWinRate()));
+   FileWriteString(fh, StringFormat("profit_factor=%.2f\n", GetProfitFactor()));
+   FileWriteString(fh, StringFormat("last_result=%s\n",  g_LastTradeResult));
+   FileWriteString(fh, StringFormat("prim_threshold=%d\n", g_DynPrimaryScore));
+   FileWriteString(fh, StringFormat("fall_threshold=%d\n", g_DynFallbackScore));
+   FileWriteString(fh, StringFormat("remote_change=%s\n", g_RemoteChangeLog));
+
+   // Open trade details
+   for(int t = 0; t < ArraySize(g_Trades) && t < 3; t++) {
+      string dir = g_Trades[t].isBuy ? "BUY" : "SELL";
+      double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+      double currentPrice = g_Trades[t].isBuy ?
+                            SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double floatPnL = g_Trades[t].isBuy ?
+                        (currentPrice - g_Trades[t].entryPrice) / pip :
+                        (g_Trades[t].entryPrice - currentPrice) / pip;
+      FileWriteString(fh, StringFormat("trade_%d=#%d %s Entry:%.2f SL:%.2f FloatPips:%.1f BE:%s\n",
+         t, g_Trades[t].ticket, dir,
+         g_Trades[t].entryPrice, g_Trades[t].initialSL,
+         floatPnL,
+         g_Trades[t].breakEvenDone ? "Done" : "Wait"));
+   }
+
+   FileClose(fh);
 }
 
 //+------------------------------------------------------------------+
@@ -3276,7 +3442,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v12.0 | %s | Magic: %d | %s",
+            StringFormat("v13.0 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
