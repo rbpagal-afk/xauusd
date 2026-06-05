@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "5.00"
-#property description "XAUUSD Sniper EA — Chart Visuals + Journal + Notifications"
+#property version     "6.00"
+#property description "XAUUSD Sniper EA — Session Close + Drawdown + Weekly/Monthly Limits"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -61,6 +61,25 @@ input int              NewsMinutesAfter  = 30;     // Minutes after news to bloc
 input group            "=== ACCOUNT FLOOR ==="
 input bool             UseBalanceFloor   = true;   // Stop trading below minimum balance
 input double           MinBalanceUSD     = 100.0;  // Minimum account balance in USD
+
+input group            "=== DRAWDOWN PROTECTION ==="
+input bool             UseMaxDrawdown    = true;   // Stop trading if drawdown exceeds limit
+input double           MaxDrawdownPct    = 10.0;   // Max drawdown % from account peak
+input bool             UseWeeklyLimit    = true;   // Enable weekly loss limit
+input double           WeeklyLossLimit   = 6.0;    // Max weekly loss % before stopping
+input double           WeeklyProfitTarget= 15.0;   // Weekly profit target % — stop and rest
+input bool             UseMonthlyLimit   = true;   // Enable monthly loss limit
+input double           MonthlyLossLimit  = 15.0;   // Max monthly loss % before stopping
+input double           MonthlyProfitTarget=30.0;   // Monthly profit target % — stop and rest
+
+input group            "=== SESSION CLOSE ==="
+input bool             CloseAtSessionEnd = true;   // Close all trades at end of NY session
+input int              SessionCloseHour  = 22;     // PHT hour to close trades (default 10PM)
+input bool             CloseOnFriday     = true;   // Close all trades before weekend
+input int              FridayCloseHour   = 21;     // PHT hour on Friday to close (default 9PM)
+input bool             TightenSLIdle     = true;   // Tighten SL if trade stalls too long
+input int              IdleBarLimit      = 20;     // Bars with no progress before tightening SL
+input double           IdleSLTightenPips = 5.0;    // Move SL closer by this many pips when idle
 
 input group            "=== AUTO TRADE ENTRY ==="
 input bool             AutoTrade         = false;  // Enable auto trade execution (false = alerts only)
@@ -211,6 +230,29 @@ string     g_JournalPath       = "";
 //--- Visual tracking — avoid redrawing every tick
 datetime   g_LastVisualBar     = 0;
 
+//--- Drawdown tracking
+double     g_PeakBalance       = 0;      // Highest balance ever reached
+double     g_CurrentDrawdown   = 0;      // Current drawdown % from peak
+bool       g_DrawdownHit       = false;  // Max drawdown triggered
+
+//--- Weekly tracking
+datetime   g_WeekStart         = 0;
+double     g_WeekStartBalance  = 0;
+double     g_WeeklyPnL         = 0;
+bool       g_WeeklyLossHit     = false;
+bool       g_WeeklyProfitHit   = false;
+
+//--- Monthly tracking
+datetime   g_MonthStart        = 0;
+double     g_MonthStartBalance = 0;
+double     g_MonthlyPnL        = 0;
+bool       g_MonthlyLossHit    = false;
+bool       g_MonthlyProfitHit  = false;
+
+//--- Session close tracking
+bool       g_SessionCloseDone  = false;  // Tracks if session close already fired today
+bool       g_FridayCloseDone   = false;  // Tracks if Friday close already fired
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
@@ -218,7 +260,10 @@ int OnInit() {
    EventSetTimer(5);
    Trade.SetDeviationInPoints(MaxSlippagePips * 10);
    Trade.SetExpertMagicNumber(MagicNumber);
+   g_PeakBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    ResetDailyTracking();
+   ResetWeeklyTracking();
+   ResetMonthlyTracking();
    InitJournal();
    CreateDashboard();
    AnalyzeAllTimeframes();
@@ -346,18 +391,41 @@ double CalcLotSize(double riskPercent, double slPips) {
 //| Master gate — is trading allowed right now?                    |
 //+------------------------------------------------------------------+
 bool IsTradingAllowed() {
+   // Drawdown
+   if(g_DrawdownHit) {
+      g_BlockReason = StringFormat("Max drawdown hit: %.2f%% — Account protection active", g_CurrentDrawdown);
+      return false;
+   }
+   // Monthly limits
+   if(g_MonthlyLossHit) {
+      g_BlockReason = StringFormat("Monthly loss limit hit: %.2f%% — Wait next month", g_MonthlyPnL);
+      return false;
+   }
+   if(g_MonthlyProfitHit) {
+      g_BlockReason = StringFormat("Monthly profit target hit: +%.2f%% — Enjoy your profits!", g_MonthlyPnL);
+      return false;
+   }
+   // Weekly limits
+   if(g_WeeklyLossHit) {
+      g_BlockReason = StringFormat("Weekly loss limit hit: %.2f%% — Wait next week", g_WeeklyPnL);
+      return false;
+   }
+   if(g_WeeklyProfitHit) {
+      g_BlockReason = StringFormat("Weekly profit target hit: +%.2f%% — Well done, rest now", g_WeeklyPnL);
+      return false;
+   }
+   // Balance floor
    if(!IsBalanceOK()) {
       g_BlockReason = StringFormat("Balance below floor ($%.2f)", MinBalanceUSD);
       return false;
    }
+   // Daily limits
    if(g_DailyProfitHit) {
-      g_BlockReason = StringFormat("Daily profit target hit: +%.2f%%  — Come back tomorrow",
-                                    DailyProfitTarget);
+      g_BlockReason = StringFormat("Daily profit target hit: +%.2f%%  — Come back tomorrow", DailyProfitTarget);
       return false;
    }
    if(g_DailyLossHit) {
-      g_BlockReason = StringFormat("Daily loss limit hit: -%.2f%%  — Come back tomorrow",
-                                    DailyLossLimit);
+      g_BlockReason = StringFormat("Daily loss limit hit: -%.2f%%  — Come back tomorrow", DailyLossLimit);
       return false;
    }
    if(g_MaxTradesHit) {
@@ -365,10 +433,19 @@ bool IsTradingAllowed() {
       return false;
    }
    if(g_ConsecLossHit) {
-      g_BlockReason = StringFormat("Max consecutive losses (%d) — Stop for today",
-                                    MaxConsecLosses);
+      g_BlockReason = StringFormat("Max consecutive losses (%d) — Stop for today", MaxConsecLosses);
       return false;
    }
+   // Friday / session close
+   if(g_FridayCloseDone) {
+      g_BlockReason = "Friday — market closing for weekend, no new trades";
+      return false;
+   }
+   if(g_SessionCloseDone) {
+      g_BlockReason = "Session ended — waiting for next trading window";
+      return false;
+   }
+   // Spread and news
    if(!IsSpreadOK()) {
       double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
                       SymbolInfoDouble(_Symbol, SYMBOL_POINT) /
@@ -415,11 +492,17 @@ void OnDeinit(const int reason) {
 //+------------------------------------------------------------------+
 void OnTick() {
    CheckNewDay();
+   CheckNewWeek();
+   CheckNewMonth();
    UpdateDailyPnL();
+   UpdateWeeklyPnL();
+   UpdateMonthlyPnL();
+   UpdateDrawdown();
+   CheckSessionClose();
    ManageCapitalProtection();
+   ManageIdleTrades();
    AnalyzeAllTimeframes();
    TryAutoEntry();
-   // Redraw visuals only on new bar to save CPU
    datetime curBar = iTime(_Symbol, TF_M15, 0);
    if(curBar != g_LastVisualBar) {
       DrawChartVisuals();
@@ -1024,6 +1107,208 @@ string GetRecommendation() {
 }
 
 //+------------------------------------------------------------------+
+//|  WEEKLY & MONTHLY TRACKING                                      |
+//+------------------------------------------------------------------+
+
+void ResetWeeklyTracking() {
+   g_WeekStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_WeeklyPnL         = 0;
+   g_WeeklyLossHit     = false;
+   g_WeeklyProfitHit   = false;
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   // Find Monday of current week
+   int wday = dt.day_of_week == 0 ? 6 : dt.day_of_week - 1;
+   g_WeekStart = TimeCurrent() - wday * 86400 -
+                 (dt.hour * 3600 + dt.min * 60 + dt.sec);
+}
+
+void ResetMonthlyTracking() {
+   g_MonthStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_MonthlyPnL         = 0;
+   g_MonthlyLossHit     = false;
+   g_MonthlyProfitHit   = false;
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   g_MonthStart = StringToTime(StringFormat("%04d.%02d.01 00:00",
+                                            dt.year, dt.mon));
+}
+
+void CheckNewWeek() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int wday    = dt.day_of_week == 0 ? 6 : dt.day_of_week - 1;
+   datetime monDay = TimeCurrent() - wday * 86400 -
+                     (dt.hour * 3600 + dt.min * 60 + dt.sec);
+   if(monDay != g_WeekStart) {
+      g_WeekStart       = monDay;
+      g_SessionCloseDone = false;
+      g_FridayCloseDone  = false;
+      ResetWeeklyTracking();
+   }
+}
+
+void CheckNewMonth() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime monthStart = StringToTime(StringFormat("%04d.%02d.01 00:00",
+                                                   dt.year, dt.mon));
+   if(monthStart != g_MonthStart)
+      ResetMonthlyTracking();
+}
+
+void UpdateWeeklyPnL() {
+   if(g_WeekStartBalance <= 0) return;
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_WeeklyPnL    = ((equity - g_WeekStartBalance) / g_WeekStartBalance) * 100.0;
+
+   if(!g_WeeklyLossHit && g_WeeklyPnL <= -WeeklyLossLimit) {
+      g_WeeklyLossHit = true;
+      string msg = StringFormat("Weekly loss limit hit: %.2f%% — Stopping for the week", g_WeeklyPnL);
+      SendDailyLimitNotification(msg);
+      CloseAllTrades("Weekly loss limit hit");
+   }
+   if(!g_WeeklyProfitHit && g_WeeklyPnL >= WeeklyProfitTarget) {
+      g_WeeklyProfitHit = true;
+      string msg = StringFormat("Weekly profit target hit: +%.2f%% — Well done! Rest now.", g_WeeklyPnL);
+      SendDailyLimitNotification(msg);
+   }
+}
+
+void UpdateMonthlyPnL() {
+   if(g_MonthStartBalance <= 0) return;
+   double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_MonthlyPnL    = ((equity - g_MonthStartBalance) / g_MonthStartBalance) * 100.0;
+
+   if(!g_MonthlyLossHit && g_MonthlyPnL <= -MonthlyLossLimit) {
+      g_MonthlyLossHit = true;
+      string msg = StringFormat("Monthly loss limit hit: %.2f%% — Stopping for the month", g_MonthlyPnL);
+      SendDailyLimitNotification(msg);
+      CloseAllTrades("Monthly loss limit hit");
+   }
+   if(!g_MonthlyProfitHit && g_MonthlyPnL >= MonthlyProfitTarget) {
+      g_MonthlyProfitHit = true;
+      string msg = StringFormat("Monthly profit target hit: +%.2f%% — Excellent! Take a break.", g_MonthlyPnL);
+      SendDailyLimitNotification(msg);
+   }
+}
+
+//+------------------------------------------------------------------+
+//|  DRAWDOWN PROTECTION                                             |
+//+------------------------------------------------------------------+
+
+void UpdateDrawdown() {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   // Update peak balance
+   if(balance > g_PeakBalance) g_PeakBalance = balance;
+
+   // Calculate drawdown from peak
+   g_CurrentDrawdown = g_PeakBalance > 0 ?
+                       ((g_PeakBalance - equity) / g_PeakBalance) * 100.0 : 0;
+
+   if(!g_DrawdownHit && UseMaxDrawdown && g_CurrentDrawdown >= MaxDrawdownPct) {
+      g_DrawdownHit = true;
+      string msg = StringFormat("MAX DRAWDOWN HIT: %.2f%% — All trades closed. Stop trading.",
+                                g_CurrentDrawdown);
+      SendDailyLimitNotification(msg);
+      CloseAllTrades("Max drawdown exceeded");
+   }
+}
+
+//+------------------------------------------------------------------+
+//|  SESSION CLOSE & FRIDAY CLOSE                                   |
+//+------------------------------------------------------------------+
+
+void CheckSessionClose() {
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt);
+   int phtHour = (dt.hour + 8) % 24;
+   bool isFriday = (dt.day_of_week == 5);
+
+   // Friday close
+   if(CloseOnFriday && isFriday && phtHour >= FridayCloseHour && !g_FridayCloseDone) {
+      CloseAllTrades("Friday close — weekend protection");
+      g_FridayCloseDone = true;
+      string msg = "Friday close triggered — all trades closed for weekend safety.";
+      SendDailyLimitNotification(msg);
+   }
+
+   // Session end close (daily at PHT SessionCloseHour)
+   if(CloseAtSessionEnd && phtHour >= SessionCloseHour && !g_SessionCloseDone) {
+      CloseAllTrades("End of NY session close");
+      g_SessionCloseDone = true;
+      // Reset flag at start of new trading window
+   }
+   // Reset session close flag when new session opens (3PM PHT = London open)
+   if(phtHour == 15) g_SessionCloseDone = false;
+}
+
+//+------------------------------------------------------------------+
+//|  CLOSE ALL EA TRADES                                             |
+//+------------------------------------------------------------------+
+
+void CloseAllTrades(string reason) {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      if(!PositionInfo.SelectByIndex(i)) continue;
+      if(PositionInfo.Symbol() != _Symbol)  continue;
+      if(PositionInfo.Magic()  != MagicNumber) continue;
+      Trade.PositionClose(PositionInfo.Ticket());
+   }
+   g_EntryLog = StringFormat("ALL TRADES CLOSED: %s", reason);
+}
+
+//+------------------------------------------------------------------+
+//|  IDLE TRADE SL TIGHTENING                                       |
+//+------------------------------------------------------------------+
+
+void ManageIdleTrades() {
+   if(!TightenSLIdle) return;
+   double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+
+   for(int i = 0; i < PositionsTotal(); i++) {
+      if(!PositionInfo.SelectByIndex(i))       continue;
+      if(PositionInfo.Symbol() != _Symbol)      continue;
+      if(PositionInfo.Magic()  != MagicNumber)  continue;
+
+      ulong  ticket    = PositionInfo.Ticket();
+      bool   isBuy     = (PositionInfo.PositionType() == POSITION_TYPE_BUY);
+      double entry     = PositionInfo.PriceOpen();
+      double currentSL = PositionInfo.StopLoss();
+      double currentTP = PositionInfo.TakeProfit();
+      double price     = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                               : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double profit    = isBuy ? (price - entry) : (entry - price);
+
+      // Only tighten if trade has not moved significantly (near breakeven)
+      if(MathAbs(profit) > IdleSLTightenPips * pip * 2) continue;
+
+      // Check how long trade has been open using bar count
+      datetime openTime = PositionInfo.Time();
+      int barsSinceOpen = Bars(_Symbol, TF_M15, openTime, TimeCurrent());
+      if(barsSinceOpen < IdleBarLimit) continue;
+
+      // Tighten SL toward price
+      double newSL = isBuy  ? currentSL + IdleSLTightenPips * pip
+                            : currentSL - IdleSLTightenPips * pip;
+      newSL = NormalizeDouble(newSL, _Digits);
+
+      // Never move SL past entry
+      if(isBuy  && newSL >= entry) newSL = entry - 2 * pip;
+      if(!isBuy && newSL <= entry) newSL = entry + 2 * pip;
+
+      bool improves = isBuy ? (newSL > currentSL) : (newSL < currentSL);
+      if(improves)
+         Trade.PositionModify(ticket, newSL, currentTP);
+   }
+}
+
+//+------------------------------------------------------------------+
+//|  MASTER GATE — updated to include all new limits                |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
 //|  TRADE JOURNAL                                                   |
 //+------------------------------------------------------------------+
 
@@ -1369,7 +1654,7 @@ void SendDailyLimitNotification(string reason) {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 64 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 76 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -1637,6 +1922,67 @@ void UpdateDashboard() {
       y += dy;
    }
 
+   // ── DRAWDOWN & PERIOD LIMITS ──
+   y += dy;
+   SetLabel(PREFIX+"DDH", x, y, "── DRAWDOWN & PERIOD LIMITS ──", ColorHeader, FontSize);
+   y += dy;
+
+   // Drawdown bar
+   color ddColor = (g_CurrentDrawdown >= MaxDrawdownPct * 0.8) ? ColorBear :
+                   (g_CurrentDrawdown >= MaxDrawdownPct * 0.5) ? ColorWarn : ColorBull;
+   string ddBar  = "";
+   int ddBars    = (int)MathMin(g_CurrentDrawdown * 2, 20);
+   for(int b = 0; b < ddBars; b++) ddBar += "|";
+   SetLabel(PREFIX+"DD1", x, y,
+            StringFormat("Drawdown: %.2f%% / %.1f%%  [%s]   Peak: $%.2f",
+                         g_CurrentDrawdown, MaxDrawdownPct, ddBar, g_PeakBalance),
+            ddColor, FontSize);
+   y += dy;
+
+   // Weekly P&L
+   color wkColor = g_WeeklyPnL >= 0 ? ColorBull : ColorBear;
+   color wkHit   = (g_WeeklyLossHit || g_WeeklyProfitHit) ? ColorBear : ColorText;
+   SetLabel(PREFIX+"WK1", x, y,
+            StringFormat("Weekly P&L: %+.2f%%  (Limit: -%.1f%%  Target: +%.1f%%)   %s",
+                         g_WeeklyPnL, WeeklyLossLimit, WeeklyProfitTarget,
+                         g_WeeklyLossHit   ? "WEEKLY LOSS HIT" :
+                         g_WeeklyProfitHit ? "WEEKLY TARGET HIT" : "Week OK"),
+            g_WeeklyLossHit || g_WeeklyProfitHit ? ColorWarn : wkColor, FontSize);
+   y += dy;
+
+   // Monthly P&L
+   color mnColor = g_MonthlyPnL >= 0 ? ColorBull : ColorBear;
+   SetLabel(PREFIX+"MN1", x, y,
+            StringFormat("Monthly P&L: %+.2f%%  (Limit: -%.1f%%  Target: +%.1f%%)   %s",
+                         g_MonthlyPnL, MonthlyLossLimit, MonthlyProfitTarget,
+                         g_MonthlyLossHit   ? "MONTHLY LOSS HIT" :
+                         g_MonthlyProfitHit ? "MONTHLY TARGET HIT" : "Month OK"),
+            g_MonthlyLossHit || g_MonthlyProfitHit ? ColorWarn : mnColor, FontSize);
+   y += dy;
+
+   // Session close status
+   MqlDateTime dtsc;
+   TimeToStruct(TimeGMT(), dtsc);
+   bool isFridayNow = (dtsc.day_of_week == 5);
+   string sessionCloseStr = g_SessionCloseDone ? "Session Close: DONE" :
+                            StringFormat("Session Close: At %d:00 PHT", SessionCloseHour);
+   string fridayCloseStr  = isFridayNow ?
+                            (g_FridayCloseDone ? "Friday Close: DONE" :
+                             StringFormat("Friday Close: At %d:00 PHT", FridayCloseHour)) :
+                            "Friday Close: Standby";
+   SetLabel(PREFIX+"SC1", x,       y, sessionCloseStr,
+            g_SessionCloseDone ? ColorWarn : ColorText, FontSize);
+   SetLabel(PREFIX+"SC2", x + 220, y, fridayCloseStr,
+            g_FridayCloseDone ? ColorWarn : ColorText, FontSize);
+   y += dy;
+
+   // Idle SL tightening status
+   SetLabel(PREFIX+"ID1", x, y,
+            StringFormat("Idle SL Tighten: %s  (after %d bars stalled, move SL %.1f pips)",
+                         TightenSLIdle ? "ON" : "OFF", IdleBarLimit, IdleSLTightenPips),
+            ColorNeutral, FontSize);
+   y += dy;
+
    // ── PERFORMANCE STATS ──
    y += dy;
    SetLabel(PREFIX+"STH", x, y, "── PERFORMANCE STATS (All-Time) ──", ColorHeader, FontSize);
@@ -1701,7 +2047,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v5.0 | %s | Magic: %d",
+            StringFormat("v6.0 | %s | Magic: %d",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS), MagicNumber),
             ColorNeutral, FontSize - 1);
 
