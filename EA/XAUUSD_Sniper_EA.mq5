@@ -3,11 +3,18 @@
 //|  Multi-Timeframe Confluence Dashboard                            |
 //|  Timeframes: H4 > H1 > M15 (Primary) | H1 > M15 > M5 (Fallback)|
 //|  Attach to ANY timeframe — dashboard always works                |
+//|  Capital Protection: Breakeven + Trailing SL + Partial TP       |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "1.00"
-#property description "Multi-TF Sniper Dashboard for XAUUSD"
+#property version     "2.00"
+#property description "Multi-TF Sniper Dashboard for XAUUSD with Capital Protection"
 #property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade         Trade;
+CPositionInfo  PositionInfo;
 
 //--- Inputs
 input group            "=== STRATEGY SETTINGS ==="
@@ -22,6 +29,19 @@ input group            "=== RISK MANAGEMENT ==="
 input double           PrimaryRisk       = 2.0;    // Primary risk % per trade
 input double           FallbackRisk      = 1.0;    // Fallback risk % per trade
 input double           MinRR             = 2.0;    // Minimum Risk:Reward
+
+input group            "=== CAPITAL PROTECTION ==="
+input bool             UseBreakeven      = true;   // Move SL to entry when profitable
+input double           BreakevenTrigger  = 1.0;    // Profit (x SL distance) to activate BE
+input double           BreakevenBuffer   = 2.0;    // Extra pips above entry for BE
+input bool             UseTrailingStop   = true;   // Trail SL as price moves in favor
+input double           TrailStart        = 1.5;    // Profit (x SL distance) to start trailing
+input double           TrailStep         = 5.0;    // Trail step in pips
+input double           TrailDistance     = 15.0;   // Trail distance behind price in pips
+input bool             UsePartialTP      = true;   // Close partial position at TP1
+input double           PartialTPPercent  = 50.0;   // % of position to close at TP1
+input double           TP1_RR            = 1.0;    // TP1 Risk:Reward ratio (1:1)
+input double           TP2_RR            = 3.0;    // TP2 Risk:Reward ratio (1:3)
 
 input group            "=== DASHBOARD ==="
 input int              Dashboard_X       = 20;     // Dashboard X position
@@ -75,6 +95,22 @@ string     g_Recommendation = "";
 bool       g_UseFallback    = false;
 datetime   g_LastUpdate     = 0;
 
+//--- Capital protection state per ticket
+struct TradeState {
+   ulong    ticket;
+   bool     breakEvenDone;
+   bool     partialTPDone;
+   double   entryPrice;
+   double   initialSL;
+   double   tp1Price;
+   double   tp2Price;
+   double   lotSize;
+   bool     isBuy;
+};
+
+TradeState g_Trades[];   // Tracks all open positions
+string     g_ProtectionStatus = "No open trades";
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
@@ -98,8 +134,163 @@ void OnDeinit(const int reason) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
+   ManageCapitalProtection();
    AnalyzeAllTimeframes();
    UpdateDashboard();
+}
+
+//+------------------------------------------------------------------+
+//| Capital Protection — Breakeven, Trail SL, Partial TP           |
+//+------------------------------------------------------------------+
+void ManageCapitalProtection() {
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip   = point * 10; // 1 pip for 5-digit broker
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      if(!PositionInfo.SelectByIndex(i)) continue;
+      if(PositionInfo.Symbol() != _Symbol) continue;
+
+      ulong  ticket     = PositionInfo.Ticket();
+      bool   isBuy      = (PositionInfo.PositionType() == POSITION_TYPE_BUY);
+      double entry      = PositionInfo.PriceOpen();
+      double currentSL  = PositionInfo.StopLoss();
+      double currentTP  = PositionInfo.TakeProfit();
+      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double price      = isBuy ? currentBid : currentAsk;
+      double lots       = PositionInfo.Volume();
+
+      // Calculate SL distance
+      double slDistance = MathAbs(entry - currentSL);
+      if(slDistance <= 0) continue;
+
+      // Current profit in price terms
+      double profit = isBuy ? (price - entry) : (entry - price);
+
+      // ── Find or create trade state ──
+      int idx = FindTradeState(ticket);
+      if(idx < 0) {
+         idx = RegisterTrade(ticket, entry, currentSL, isBuy, lots);
+         if(idx < 0) continue;
+      }
+
+      // ── PARTIAL TP — Close 50% at TP1 (1:1 RR) ──
+      if(UsePartialTP && !g_Trades[idx].partialTPDone) {
+         double tp1Distance = slDistance * TP1_RR;
+         if(profit >= tp1Distance) {
+            double closeVolume = NormalizeDouble(lots * PartialTPPercent / 100.0,
+                                                SymbolInfoInteger(_Symbol, SYMBOL_VOLUME_STEP) > 0 ? 2 : 2);
+            closeVolume = MathMax(closeVolume, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+
+            if(closeVolume < lots) {
+               if(isBuy)
+                  Trade.Sell(closeVolume, _Symbol, currentBid, 0, 0,
+                             StringFormat("Partial TP1 #%d", ticket));
+               else
+                  Trade.Buy(closeVolume, _Symbol, currentAsk, 0, 0,
+                            StringFormat("Partial TP1 #%d", ticket));
+
+               g_Trades[idx].partialTPDone = true;
+               g_ProtectionStatus = StringFormat("Partial TP hit — closed %.0f%% at #%d",
+                                                  PartialTPPercent, ticket);
+            }
+         }
+      }
+
+      // ── BREAKEVEN — Move SL to entry when profit >= trigger ──
+      if(UseBreakeven && !g_Trades[idx].breakEvenDone) {
+         double beTriggerDist = slDistance * BreakevenTrigger;
+         if(profit >= beTriggerDist) {
+            double newSL = isBuy  ? entry + BreakevenBuffer * pip
+                                  : entry - BreakevenBuffer * pip;
+            newSL = NormalizeDouble(newSL, _Digits);
+
+            // Only move SL if it improves (never widen it)
+            bool shouldMove = isBuy  ? (newSL > currentSL)
+                                     : (newSL < currentSL || currentSL == 0);
+            if(shouldMove) {
+               Trade.PositionModify(ticket, newSL, currentTP);
+               g_Trades[idx].breakEvenDone = true;
+               g_ProtectionStatus = StringFormat("Breakeven set at %.5f for #%d", newSL, ticket);
+            }
+         }
+      }
+
+      // ── TRAILING STOP — Follow price once trail starts ──
+      if(UseTrailingStop) {
+         double trailTriggerDist = slDistance * TrailStart;
+         if(profit >= trailTriggerDist) {
+            double trailDist = TrailDistance * pip;
+            double trailSL   = isBuy  ? price - trailDist
+                                       : price + trailDist;
+            trailSL = NormalizeDouble(trailSL, _Digits);
+
+            // Only move SL if it improves position
+            bool shouldTrail = isBuy  ? (trailSL > currentSL + TrailStep * pip)
+                                      : (trailSL < currentSL - TrailStep * pip ||
+                                         currentSL == 0);
+            if(shouldTrail) {
+               Trade.PositionModify(ticket, trailSL, currentTP);
+               g_ProtectionStatus = StringFormat("Trailing SL moved to %.5f for #%d",
+                                                  trailSL, ticket);
+            }
+         }
+      }
+   }
+
+   // Clean up closed trades from state array
+   CleanupClosedTrades();
+}
+
+//+------------------------------------------------------------------+
+//| Find trade state index by ticket                                |
+//+------------------------------------------------------------------+
+int FindTradeState(ulong ticket) {
+   for(int i = 0; i < ArraySize(g_Trades); i++)
+      if(g_Trades[i].ticket == ticket)
+         return i;
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Register a new trade in state array                             |
+//+------------------------------------------------------------------+
+int RegisterTrade(ulong ticket, double entry, double sl,
+                  bool isBuy, double lots) {
+   double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double slDist    = MathAbs(entry - sl);
+
+   int idx = ArraySize(g_Trades);
+   ArrayResize(g_Trades, idx + 1);
+
+   g_Trades[idx].ticket        = ticket;
+   g_Trades[idx].breakEvenDone = false;
+   g_Trades[idx].partialTPDone = false;
+   g_Trades[idx].entryPrice    = entry;
+   g_Trades[idx].initialSL     = sl;
+   g_Trades[idx].isBuy         = isBuy;
+   g_Trades[idx].lotSize       = lots;
+   g_Trades[idx].tp1Price      = isBuy ? entry + slDist * TP1_RR
+                                        : entry - slDist * TP1_RR;
+   g_Trades[idx].tp2Price      = isBuy ? entry + slDist * TP2_RR
+                                        : entry - slDist * TP2_RR;
+   return idx;
+}
+
+//+------------------------------------------------------------------+
+//| Remove closed trades from state array                           |
+//+------------------------------------------------------------------+
+void CleanupClosedTrades() {
+   for(int i = ArraySize(g_Trades) - 1; i >= 0; i--) {
+      if(!PositionSelectByTicket(g_Trades[i].ticket)) {
+         // Shift array left
+         for(int j = i; j < ArraySize(g_Trades) - 1; j++)
+            g_Trades[j] = g_Trades[j + 1];
+         ArrayResize(g_Trades, ArraySize(g_Trades) - 1);
+      }
+   }
+   if(ArraySize(g_Trades) == 0)
+      g_ProtectionStatus = "No open trades";
 }
 
 //+------------------------------------------------------------------+
@@ -372,7 +563,7 @@ string GetRecommendation() {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 26 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 36 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -512,6 +703,49 @@ void UpdateDashboard() {
    SetLabel(PREFIX+"REC", x, y, g_Recommendation, recColor, FontSize);
    y += dy;
 
+   // ── CAPITAL PROTECTION STATUS ──
+   y += dy;
+   SetLabel(PREFIX+"CPH", x, y, "── CAPITAL PROTECTION ──", ColorHeader, FontSize);
+   y += dy;
+
+   // Settings summary
+   SetLabel(PREFIX+"CP1", x, y,
+            StringFormat("Breakeven: %s (trigger: %.1fx SL)   Trail SL: %s (start: %.1fx SL, dist: %.0f pips)",
+                         UseBreakeven ? "ON" : "OFF", BreakevenTrigger,
+                         UseTrailingStop ? "ON" : "OFF", TrailStart, TrailDistance),
+            ColorNeutral, FontSize);
+   y += dy;
+
+   SetLabel(PREFIX+"CP2", x, y,
+            StringFormat("Partial TP: %s (close %.0f%% at TP1 = 1:%.0f RR)   Full TP at 1:%.0f RR",
+                         UsePartialTP ? "ON" : "OFF", PartialTPPercent, TP1_RR, TP2_RR),
+            ColorNeutral, FontSize);
+   y += dy;
+
+   // Open trades protection status
+   int openTrades = ArraySize(g_Trades);
+   color cpColor  = openTrades > 0 ? ColorBull : ColorNeutral;
+   SetLabel(PREFIX+"CP3", x, y,
+            StringFormat("Open Trades: %d  |  %s", openTrades, g_ProtectionStatus),
+            cpColor, FontSize);
+   y += dy;
+
+   // Show each open trade details
+   for(int t = 0; t < openTrades && t < 3; t++) {
+      string dir     = g_Trades[t].isBuy ? "BUY " : "SELL";
+      string be      = g_Trades[t].breakEvenDone  ? "BE:Done" : "BE:Wait";
+      string partial = g_Trades[t].partialTPDone  ? "TP1:Done" : "TP1:Wait";
+      SetLabel(PREFIX+"CPT"+IntegerToString(t), x, y,
+               StringFormat("  #%d %s | Entry:%.2f | SL:%.2f | TP1:%.2f | TP2:%.2f | %s | %s",
+                            g_Trades[t].ticket, dir,
+                            g_Trades[t].entryPrice, g_Trades[t].initialSL,
+                            g_Trades[t].tp1Price, g_Trades[t].tp2Price,
+                            be, partial),
+               g_Trades[t].isBuy ? ColorBull : ColorBear, FontSize);
+      y += dy;
+   }
+
+   y += 4;
    // Last updated
    SetLabel(PREFIX+"UPD", x, y,
             StringFormat("Last updated: %s", TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS)),
