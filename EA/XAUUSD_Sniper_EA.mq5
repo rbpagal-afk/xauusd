@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "11.00"
-#property description "XAUUSD Sniper EA — Adaptive Learning System v11.0"
+#property version     "12.00"
+#property description "XAUUSD Sniper EA — Claude AI Bridge v12.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -98,6 +98,14 @@ input int              FridayCloseHour   = 21;     // PHT hour on Friday to clos
 input bool             TightenSLIdle     = true;   // Tighten SL if trade stalls too long
 input int              IdleBarLimit      = 20;     // Bars with no progress before tightening SL
 input double           IdleSLTightenPips = 5.0;    // Move SL closer by this many pips when idle
+
+input group            "=== CLAUDE AI BRIDGE ==="
+input bool             UseBridge         = false;  // Connect EA to Claude AI for signal validation
+input bool             BridgeMustApprove = true;   // true=skip trade if no Claude response in time
+input int              BridgeTimeoutSec  = 30;     // Seconds to wait for Claude response
+input string           BridgeSignalFile  = "SNP_Signal.txt";   // EA writes signal here
+input string           BridgeRespFile    = "SNP_Response.txt"; // Claude writes verdict here
+input string           BridgeResultFile  = "SNP_Result.txt";   // EA writes closed trade here
 
 input group            "=== AUTO TRADE ENTRY ==="
 input bool             AutoTrade         = false;  // Enable auto trade execution (false = alerts only)
@@ -300,6 +308,26 @@ int    g_PrimaryWins      = 0;
 int    g_FallbackWins     = 0;
 int    g_BatchTradeCount  = 0;   // Counts toward next adjustment cycle
 string g_LearnStatus      = "Learning: accumulating trades...";
+
+//--- Claude AI Bridge state
+enum BridgeState { BRIDGE_IDLE=0, BRIDGE_WAITING=1, BRIDGE_APPROVED=2, BRIDGE_REJECTED=3 };
+BridgeState g_BridgeState     = BRIDGE_IDLE;
+datetime    g_BridgeWriteTime = 0;       // When signal file was written
+string      g_BridgeVerdict   = "";      // TAKE / SKIP / ADJUST_SL
+string      g_BridgeReason    = "";      // Claude's reasoning text
+string      g_BridgeSLStr     = "";      // Adjusted SL if ADJUST_SL verdict
+string      g_BridgeStatus    = "Bridge: Standby";
+
+// Pending trade parameters held while waiting for Claude
+bool        g_PendingIsBuy    = false;
+double      g_PendingEntry    = 0;
+double      g_PendingSL       = 0;
+double      g_PendingTP1      = 0;
+double      g_PendingTP2      = 0;
+double      g_PendingLots     = 0;
+double      g_PendingRisk     = 0;
+string      g_PendingStrategy = "";
+int         g_PendingScore    = 0;
 
 //--- Lot size calculator state
 double     g_LastLotSize       = 0;
@@ -981,6 +1009,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             // Update adaptive learning stats
             UpdateLearningStats(dealTicket, wasWin, strat);
 
+            // Notify Claude bridge of trade result
+            WriteBridgeResult(dealTicket, wasWin, profit, strat, g_LastSignalScore);
+
             if(!g_IsTesting) {
                JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
                                  ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
@@ -1040,6 +1071,25 @@ void TryAutoEntry() {
    double riskPct   = primaryReady ? PrimaryRisk : FallbackRisk;
    string strategy  = primaryReady ? "PRIMARY" : "FALLBACK";
 
+   // ── BRIDGE STATE MACHINE ──
+   if(UseBridge) {
+      // If waiting for Claude response — check file or timeout
+      if(g_BridgeState == BRIDGE_WAITING) {
+         CheckBridgeTimeout();
+         if(!ReadBridgeResponse()) return; // Still waiting
+      }
+
+      // If Claude rejected — reset and skip this bar
+      if(g_BridgeState == BRIDGE_REJECTED) {
+         g_BridgeState = BRIDGE_IDLE;
+         g_EntryLog    = StringFormat("Claude SKIPPED: %s", g_BridgeReason);
+         return;
+      }
+
+      // If approved with SL adjustment — use Claude's SL
+      // (applied below after SL calculation)
+   }
+
    // ── DXY CORRELATION CHECK ──
    if(!IsDXYAligned(isBuy)) {
       g_EntryLog = StringFormat("DXY BLOCKED: %s trade conflicts with DXY — %s",
@@ -1088,6 +1138,37 @@ void TryAutoEntry() {
    tp2 = NormalizeDouble(tp2, _Digits);
 
    string comment = StringFormat("Sniper %s %s Sc:%d", strategy, isBuy?"BUY":"SELL", score);
+
+   // ── BRIDGE — write signal and wait for Claude approval ──
+   if(UseBridge && g_BridgeState == BRIDGE_IDLE) {
+      // Store pending trade parameters
+      g_PendingIsBuy    = isBuy;
+      g_PendingEntry    = entry;
+      g_PendingSL       = sl;
+      g_PendingTP1      = tp1;
+      g_PendingTP2      = tp2;
+      g_PendingLots     = lots;
+      g_PendingRisk     = riskPct;
+      g_PendingStrategy = strategy;
+      g_PendingScore    = score;
+      WriteBridgeSignal(isBuy, score, strategy, entry, sl, tp1, tp2, lots, riskPct);
+      return; // Come back next tick with response
+   }
+
+   // If bridge approved with SL adjustment — apply Claude's suggested SL
+   if(UseBridge && g_BridgeState == BRIDGE_APPROVED && StringLen(g_BridgeSLStr) > 0) {
+      double claudeSL = StringToDouble(g_BridgeSLStr);
+      if(claudeSL > 0) {
+         sl  = claudeSL;
+         // Recalculate SL pips and lots with new SL
+         double newSlPips = MathAbs(entry - sl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+         lots = CalcLotSize(riskPct, newSlPips);
+         g_EntryLog = StringFormat("Claude adjusted SL to %.2f", sl);
+      }
+   }
+
+   // Reset bridge state for next trade
+   if(UseBridge) g_BridgeState = BRIDGE_IDLE;
 
    // Alert regardless of AutoTrade setting
    if(!g_AlertSent) {
@@ -1362,6 +1443,174 @@ string GetSession() {
    if(pht >= 20 && pht < 22)  return "New York Open — TRADE WINDOW 2 (BEST)";
    if(pht >= 22)               return "After Hours — Close Charts & Rest";
    return "Pre-Market — Prepare Charts";
+}
+
+//+------------------------------------------------------------------+
+//| CLAUDE AI BRIDGE FUNCTIONS                                      |
+//+------------------------------------------------------------------+
+
+//--- Write signal file for Claude to read
+void WriteBridgeSignal(bool isBuy, int score, string strategy,
+                       double entry, double sl, double tp1, double tp2,
+                       double lots, double riskPct) {
+   int fh = FileOpen(BridgeSignalFile, FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) {
+      g_BridgeStatus = "Bridge ERROR: Cannot write signal file";
+      return;
+   }
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int phtH = (dt.hour + 8) % 24;
+
+   FileWriteString(fh, "XAUUSD_SNIPER_SIGNAL\n");
+   FileWriteString(fh, StringFormat("time=%s PHT %02d:%02d\n",
+      TimeToString(TimeCurrent(), TIME_DATE), phtH, dt.min));
+   FileWriteString(fh, StringFormat("strategy=%s\n",    strategy));
+   FileWriteString(fh, StringFormat("direction=%s\n",   isBuy ? "BUY" : "SELL"));
+   FileWriteString(fh, StringFormat("score=%d/42\n",    score));
+   FileWriteString(fh, StringFormat("session=%s\n",     g_Session));
+
+   // H4 context
+   FileWriteString(fh, StringFormat("h4_bias=%s\n",     g_H4.bullish ? "BULLISH" : "BEARISH"));
+   FileWriteString(fh, StringFormat("h4_extbos=%s\n",   g_H4.hasExternalBOS  ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h4_mss=%s\n",      g_H4.hasMSS          ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h4_freshob=%s\n",  g_H4.hasFreshOB      ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h4_ob_status=%s\n",g_H4.obStatus));
+   FileWriteString(fh, StringFormat("h4_atsr=%s\n",     g_H4.atKeySR         ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h4_zone=%s\n",     g_H4.inDiscount ? "Discount" :
+                                                         g_H4.inPremium  ? "Premium"  : "Equilibrium"));
+   FileWriteString(fh, StringFormat("h4_weekly=%.2f/%.2f\n", g_H4.weeklyHigh, g_H4.weeklyLow));
+
+   // H1 context
+   FileWriteString(fh, StringFormat("h1_bias=%s\n",     g_H1.bullish ? "BULLISH" : "BEARISH"));
+   FileWriteString(fh, StringFormat("h1_choch=%s\n",    g_H1.hasCHoCH        ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h1_mss=%s\n",      g_H1.hasMSS          ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h1_freshob=%s\n",  g_H1.hasFreshOB      ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h1_fvgopen=%s\n",  g_H1.hasFVGOpen      ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h1_ote=%s\n",      g_H1.inOTE           ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h1_sweep=%s\n",    g_H1.hasLiqSweep     ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("h1_displacement=%s\n", g_H1.hasDisplacement ? "YES" : "NO"));
+
+   // M15 context
+   FileWriteString(fh, StringFormat("m15_bias=%s\n",    g_M15.bullish ? "BULLISH" : "BEARISH"));
+   FileWriteString(fh, StringFormat("m15_sweep=%s\n",   g_M15.hasLiqSweep    ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("m15_choch=%s\n",   g_M15.hasCHoCH       ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("m15_mss=%s\n",     g_M15.hasMSS         ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("m15_freshob=%s\n", g_M15.hasFreshOB     ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("m15_fvgopen=%s\n", g_M15.hasFVGOpen     ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("m15_judas=%s\n",   g_M15.isJudasSwing   ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("m15_silver=%s\n",  g_M15.inSilverBullet ? "YES" : "NO"));
+
+   // Filters
+   FileWriteString(fh, StringFormat("dxy_status=%s\n",  g_DXY_Status));
+   FileWriteString(fh, StringFormat("candle=%s\n",      g_CandlePattern));
+   FileWriteString(fh, StringFormat("news=%s\n",        g_NewsBlocked ? "BLOCKED" : "Clear"));
+
+   // Trade levels
+   FileWriteString(fh, StringFormat("entry=%.2f\n",     entry));
+   FileWriteString(fh, StringFormat("sl=%.2f\n",        sl));
+   FileWriteString(fh, StringFormat("tp1=%.2f\n",       tp1));
+   FileWriteString(fh, StringFormat("tp2=%.2f\n",       tp2));
+   FileWriteString(fh, StringFormat("sl_pips=%.1f\n",
+      MathAbs(entry - sl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10)));
+   FileWriteString(fh, StringFormat("rr=1:%.1f\n",      TP2_RR));
+   FileWriteString(fh, StringFormat("lots=%.2f\n",      lots));
+   FileWriteString(fh, StringFormat("risk_pct=%.1f\n",  riskPct));
+
+   // Account context
+   FileWriteString(fh, StringFormat("balance=%.2f\n",   AccountInfoDouble(ACCOUNT_BALANCE)));
+   FileWriteString(fh, StringFormat("equity=%.2f\n",    AccountInfoDouble(ACCOUNT_EQUITY)));
+   FileWriteString(fh, StringFormat("daily_pnl=%+.2f%%\n", g_DailyPnL));
+   FileWriteString(fh, StringFormat("daily_trades=%d/%d\n", g_DailyTradeCount, MaxDailyTrades));
+   FileWriteString(fh, StringFormat("drawdown=%.2f%%\n", g_CurrentDrawdown));
+
+   // Learning context
+   if(UseAdaptiveLearning && g_PrimaryTrades + g_FallbackTrades >= MinTradesForAdjust) {
+      double primWR = g_PrimaryTrades  > 0 ? (double)g_PrimaryWins  / g_PrimaryTrades  * 100.0 : 0;
+      double fallWR = g_FallbackTrades > 0 ? (double)g_FallbackWins / g_FallbackTrades * 100.0 : 0;
+      FileWriteString(fh, StringFormat("primary_winrate=%.1f%%\n", primWR));
+      FileWriteString(fh, StringFormat("fallback_winrate=%.1f%%\n", fallWR));
+   }
+
+   FileWriteString(fh, "END_SIGNAL\n");
+   FileClose(fh);
+
+   g_BridgeWriteTime = TimeCurrent();
+   g_BridgeState     = BRIDGE_WAITING;
+   g_BridgeStatus    = StringFormat("Bridge: Signal sent — waiting for Claude (%ds timeout)...",
+                                    BridgeTimeoutSec);
+}
+
+//--- Read and parse Claude's response file
+bool ReadBridgeResponse() {
+   if(!FileIsExist(BridgeRespFile, FILE_COMMON)) return false;
+
+   int fh = FileOpen(BridgeRespFile, FILE_READ|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return false;
+
+   g_BridgeVerdict = "";
+   g_BridgeReason  = "";
+   g_BridgeSLStr   = "";
+
+   while(!FileIsEnding(fh)) {
+      string line = FileReadString(fh);
+      if(StringFind(line, "VERDICT=")   == 0) g_BridgeVerdict = StringSubstr(line, 8);
+      if(StringFind(line, "REASON=")    == 0) g_BridgeReason  = StringSubstr(line, 7);
+      if(StringFind(line, "ADJUST_SL=") == 0) g_BridgeSLStr   = StringSubstr(line, 10);
+   }
+   FileClose(fh);
+
+   // Delete response file so it does not trigger again
+   FileDelete(BridgeRespFile, FILE_COMMON);
+
+   if(g_BridgeVerdict == "TAKE" || g_BridgeVerdict == "ADJUST_SL") {
+      g_BridgeState  = BRIDGE_APPROVED;
+      g_BridgeStatus = StringFormat("Claude: APPROVED — %s", g_BridgeReason);
+   } else {
+      g_BridgeState  = BRIDGE_REJECTED;
+      g_BridgeStatus = StringFormat("Claude: SKIP — %s", g_BridgeReason);
+   }
+   return true;
+}
+
+//--- Write trade result file so Claude can learn
+void WriteBridgeResult(ulong ticket, bool wasWin, double profit,
+                       string strategy, int score) {
+   if(!UseBridge) return;
+   int fh = FileOpen(BridgeResultFile, FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+
+   FileWriteString(fh, "XAUUSD_SNIPER_RESULT\n");
+   FileWriteString(fh, StringFormat("ticket=%d\n",     ticket));
+   FileWriteString(fh, StringFormat("result=%s\n",     wasWin ? "WIN" : "LOSS"));
+   FileWriteString(fh, StringFormat("profit=%.2f\n",   profit));
+   FileWriteString(fh, StringFormat("strategy=%s\n",   strategy));
+   FileWriteString(fh, StringFormat("score=%d\n",      score));
+   FileWriteString(fh, StringFormat("session=%s\n",    g_Session));
+   FileWriteString(fh, StringFormat("balance=%.2f\n",  AccountInfoDouble(ACCOUNT_BALANCE)));
+   FileWriteString(fh, StringFormat("time=%s\n",       TimeToString(TimeCurrent())));
+   FileWriteString(fh, "END_RESULT\n");
+   FileClose(fh);
+}
+
+//--- Check bridge timeout — proceed or abort based on settings
+void CheckBridgeTimeout() {
+   if(g_BridgeState != BRIDGE_WAITING) return;
+   int elapsed = (int)(TimeCurrent() - g_BridgeWriteTime);
+   if(elapsed < BridgeTimeoutSec) return;
+
+   // Timed out
+   FileDelete(BridgeSignalFile, FILE_COMMON);
+   if(BridgeMustApprove) {
+      g_BridgeState  = BRIDGE_REJECTED;
+      g_BridgeStatus = StringFormat("Bridge: Timeout after %ds — trade SKIPPED (BridgeMustApprove=true)",
+                                    BridgeTimeoutSec);
+   } else {
+      g_BridgeState  = BRIDGE_APPROVED;
+      g_BridgeStatus = StringFormat("Bridge: Timeout after %ds — proceeding without Claude",
+                                    BridgeTimeoutSec);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -2346,7 +2595,7 @@ string TR(string label, string value) {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 130 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 145 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -2624,6 +2873,48 @@ void UpdateDashboard() {
       y += dy;
    }
    y += 4;
+
+   // ── CLAUDE AI BRIDGE ──
+   SetLabel(PREFIX+"BRH", x, y, "── CLAUDE AI BRIDGE ──", ColorHeader, FontSize);
+   y += dy;
+
+   if(!UseBridge) {
+      SetLabel(PREFIX+"BR1", x, y, "Bridge: OFF — enable UseBridge in settings to connect Claude AI",
+               ColorNeutral, FontSize);
+      y += dy + 4;
+   } else {
+      color brClr = g_BridgeState == BRIDGE_WAITING  ? ColorWarn  :
+                    g_BridgeState == BRIDGE_APPROVED  ? ColorBull  :
+                    g_BridgeState == BRIDGE_REJECTED  ? ColorBear  : ColorNeutral;
+      SetLabel(PREFIX+"BR1", x, y, g_BridgeStatus, brClr, FontSize);
+      y += dy;
+
+      // Show last verdict details
+      if(StringLen(g_BridgeReason) > 0) {
+         SetLabel(PREFIX+"BR2", x, y,
+                  StringFormat("Last verdict: %s — %s", g_BridgeVerdict, g_BridgeReason),
+                  g_BridgeState == BRIDGE_APPROVED ? ColorBull : ColorBear, FontSize);
+         y += dy;
+      }
+
+      // Timeout countdown if waiting
+      if(g_BridgeState == BRIDGE_WAITING) {
+         int elapsed  = (int)(TimeCurrent() - g_BridgeWriteTime);
+         int remaining = BridgeTimeoutSec - elapsed;
+         SetLabel(PREFIX+"BR3", x, y,
+                  StringFormat("Waiting for Claude response... %ds remaining  (Files: %s / %s)",
+                               MathMax(0, remaining), BridgeSignalFile, BridgeRespFile),
+                  ColorWarn, FontSize);
+         y += dy;
+      }
+
+      SetLabel(PREFIX+"BR4", x, y,
+               StringFormat("Signal file: %s   Response file: %s   Timeout: %ds  MustApprove: %s",
+                            BridgeSignalFile, BridgeRespFile, BridgeTimeoutSec,
+                            BridgeMustApprove ? "YES" : "NO"),
+               ColorNeutral, FontSize);
+      y += dy + 4;
+   }
 
    // ── RECOMMENDATION ──
    SetLabel(PREFIX+"RH", x, y, "── TRADE RECOMMENDATION ──", ColorHeader, FontSize);
@@ -2985,7 +3276,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v11.0 | %s | Magic: %d | %s",
+            StringFormat("v12.0 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
