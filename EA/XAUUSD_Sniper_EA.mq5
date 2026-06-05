@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "3.00"
-#property description "Multi-TF Sniper Dashboard for XAUUSD — Full Capital Protection"
+#property version     "4.00"
+#property description "XAUUSD Sniper EA — Auto Entry + Full Capital Protection"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -61,6 +61,14 @@ input int              NewsMinutesAfter  = 30;     // Minutes after news to bloc
 input group            "=== ACCOUNT FLOOR ==="
 input bool             UseBalanceFloor   = true;   // Stop trading below minimum balance
 input double           MinBalanceUSD     = 100.0;  // Minimum account balance in USD
+
+input group            "=== AUTO TRADE ENTRY ==="
+input bool             AutoTrade         = false;  // Enable auto trade execution (false = alerts only)
+input bool             AlertOnSignal     = true;   // Send alert when signal is ready
+input int              MagicNumber       = 202401; // EA magic number
+input double           SL_BufferPips     = 5.0;    // Extra pips beyond sweep for SL
+input int              CooldownBars      = 3;      // Bars to wait after last trade before new entry
+input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time
 
 input group            "=== DASHBOARD ==="
 input int              Dashboard_X       = 20;     // Dashboard X position
@@ -155,12 +163,20 @@ int g_NewsEvents[] = {
 double     g_LastLotSize       = 0;
 string     g_BlockReason       = "";     // Why trading is blocked
 
+//--- Auto entry state
+datetime   g_LastEntryBar      = 0;      // Bar time of last entry
+int        g_LastSignalScore   = 0;      // Score of last signal sent
+bool       g_AlertSent         = false;  // Alert already sent for this signal
+string     g_LastTradeResult   = "";     // Result of last closed trade
+string     g_EntryLog          = "";     // Last entry action log
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
    EventSetTimer(5);
    Trade.SetDeviationInPoints(MaxSlippagePips * 10);
+   Trade.SetExpertMagicNumber(MagicNumber);
    ResetDailyTracking();
    CreateDashboard();
    AnalyzeAllTimeframes();
@@ -358,7 +374,159 @@ void OnTick() {
    UpdateDailyPnL();
    ManageCapitalProtection();
    AnalyzeAllTimeframes();
+   TryAutoEntry();
    UpdateDashboard();
+}
+
+//+------------------------------------------------------------------+
+//| Track trade results via transaction events                       |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result) {
+   // Only care about deal additions (trade closed)
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   if(trans.deal_type != DEAL_TYPE_BUY &&
+      trans.deal_type != DEAL_TYPE_SELL) return;
+
+   // Find if this is a closing deal (entry = OUT)
+   if(HistoryDealSelect(trans.deal)) {
+      long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT) {
+         double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+         bool   wasWin = (profit > 0);
+         OnTradeClose(wasWin);
+         g_LastTradeResult = StringFormat("%s  $%.2f  (%s)",
+                             TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES),
+                             profit,
+                             wasWin ? "WIN" : "LOSS");
+         // Reset alert flag so next signal can alert again
+         g_AlertSent = false;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Auto Entry — fires when confluence score meets threshold         |
+//+------------------------------------------------------------------+
+void TryAutoEntry() {
+   if(!IsTradingAllowed()) return;
+
+   // Only enter during valid sessions
+   bool inSession = (g_Session == "London Open — TRADE WINDOW 1"      ||
+                     g_Session == "New York Open — TRADE WINDOW 2 (BEST)" ||
+                     g_Session == "London Session (Selective)");
+   if(!inSession) { g_AlertSent = false; return; }
+
+   // Check cooldown — wait CooldownBars after last trade
+   datetime currentBar = iTime(_Symbol, TF_M15, 0);
+   if(currentBar == g_LastEntryBar) return;
+
+   // One trade at a time check
+   if(OneTradeAtATime && CountOpenTrades() > 0) return;
+
+   // Determine which strategy triggered
+   bool   primaryReady  = (g_PrimaryScore  >= MinPrimaryScore);
+   bool   fallbackReady = (g_FallbackScore >= MinFallbackScore) && !primaryReady;
+   if(!primaryReady && !fallbackReady) { g_AlertSent = false; return; }
+
+   bool   isBuy     = primaryReady ? g_H4.bullish : g_H1.bullish;
+   int    score     = primaryReady ? g_PrimaryScore : g_FallbackScore;
+   double riskPct   = primaryReady ? PrimaryRisk : FallbackRisk;
+   string strategy  = primaryReady ? "PRIMARY" : "FALLBACK";
+
+   // Avoid re-alerting same signal
+   if(g_AlertSent && score == g_LastSignalScore) return;
+
+   // Calculate SL from recent sweep wick
+   double pip    = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double slRef  = GetSweepLevel(isBuy, primaryReady ? TF_M15 : TF_M5);
+   double slPips = MathAbs((isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                  : SymbolInfoDouble(_Symbol, SYMBOL_BID)) - slRef)
+                   / pip + SL_BufferPips;
+   slPips = MathMax(slPips, 10.0); // Minimum 10 pip SL
+
+   // Check minimum RR
+   double tp2Pips = slPips * TP2_RR;
+   if(tp2Pips / slPips < MinRR) return;
+
+   // Calculate lot size using exact SL
+   double lots = CalcLotSize(riskPct, slPips);
+   g_LastLotSize = lots;
+
+   // Build prices
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double entry  = isBuy ? ask : bid;
+   double sl     = isBuy ? entry - slPips * pip : entry + slPips * pip;
+   double tp1    = isBuy ? entry + slPips * TP1_RR * pip : entry - slPips * TP1_RR * pip;
+   double tp2    = isBuy ? entry + slPips * TP2_RR * pip : entry - slPips * TP2_RR * pip;
+
+   sl  = NormalizeDouble(sl,  _Digits);
+   tp2 = NormalizeDouble(tp2, _Digits);
+
+   string comment = StringFormat("Sniper %s %s Sc:%d", strategy, isBuy?"BUY":"SELL", score);
+
+   // Alert regardless of AutoTrade setting
+   if(AlertOnSignal && !g_AlertSent) {
+      string msg = StringFormat(
+         "XAUUSD SNIPER SIGNAL\n%s %s\nScore: %d/13\nEntry: %.2f\nSL: %.2f (%.1f pips)\nTP1: %.2f  TP2: %.2f\nRisk: %.1f%%  Lots: %.2f",
+         strategy, isBuy ? "BUY" : "SELL", score,
+         entry, sl, slPips, tp1, tp2, riskPct, lots);
+      Alert(msg);
+      g_AlertSent     = true;
+      g_LastSignalScore = score;
+      g_EntryLog = StringFormat("SIGNAL: %s %s | Score:%d | Entry:%.2f SL:%.2f TP2:%.2f | Lots:%.2f",
+                                strategy, isBuy?"BUY":"SELL", score, entry, sl, tp2, lots);
+   }
+
+   // Auto execute if enabled
+   if(!AutoTrade) return;
+
+   bool ok = false;
+   if(isBuy)
+      ok = Trade.Buy(lots, _Symbol, ask, sl, tp2, comment);
+   else
+      ok = Trade.Sell(lots, _Symbol, bid, sl, tp2, comment);
+
+   if(ok) {
+      g_LastEntryBar = currentBar;
+      g_EntryLog = StringFormat("ENTERED: %s %s | Score:%d | Entry:%.2f SL:%.2f TP2:%.2f | Lots:%.2f | #%d",
+                                strategy, isBuy?"BUY":"SELL", score,
+                                entry, sl, tp2, lots, Trade.ResultOrder());
+   } else {
+      g_EntryLog = StringFormat("ENTRY FAILED: Error %d — %s",
+                                Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get sweep level (lowest wick for buy, highest wick for sell)    |
+//+------------------------------------------------------------------+
+double GetSweepLevel(bool isBuy, ENUM_TIMEFRAMES tf) {
+   double arr[];
+   ArraySetAsSeries(arr, true);
+   if(isBuy) {
+      CopyLow(_Symbol, tf, 1, Sweep_Lookback, arr);
+      return arr[ArrayMinimum(arr, 0, Sweep_Lookback)];
+   } else {
+      CopyHigh(_Symbol, tf, 1, Sweep_Lookback, arr);
+      return arr[ArrayMaximum(arr, 0, Sweep_Lookback)];
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count EA's open trades on this symbol                           |
+//+------------------------------------------------------------------+
+int CountOpenTrades() {
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++) {
+      if(PositionInfo.SelectByIndex(i))
+         if(PositionInfo.Symbol() == _Symbol &&
+            PositionInfo.Magic()  == MagicNumber)
+            count++;
+   }
+   return count;
 }
 
 //+------------------------------------------------------------------+
@@ -795,7 +963,7 @@ string GetRecommendation() {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 46 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 54 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -1037,10 +1205,37 @@ void UpdateDashboard() {
       y += dy;
    }
 
+   // ── AUTO ENTRY STATUS ──
+   y += dy;
+   SetLabel(PREFIX+"AEH", x, y, "── AUTO ENTRY STATUS ──", ColorHeader, FontSize);
+   y += dy;
+
+   string autoMode = AutoTrade ? "AUTO TRADE: ON (will execute automatically)" :
+                                 "AUTO TRADE: OFF (alerts only — you click manually)";
+   color autoColor = AutoTrade ? ColorBull : ColorWarn;
+   SetLabel(PREFIX+"AE1", x, y, autoMode, autoColor, FontSize);
+   y += dy;
+
+   if(g_EntryLog != "") {
+      color logColor = (StringFind(g_EntryLog, "ENTERED") >= 0)  ? ColorBull  :
+                       (StringFind(g_EntryLog, "SIGNAL")  >= 0)  ? ColorWarn  :
+                       (StringFind(g_EntryLog, "FAILED")  >= 0)  ? ColorBear  : ColorNeutral;
+      SetLabel(PREFIX+"AE2", x, y, g_EntryLog, logColor, FontSize);
+      y += dy;
+   }
+
+   if(g_LastTradeResult != "") {
+      color resColor = (StringFind(g_LastTradeResult, "WIN") >= 0) ? ColorBull : ColorBear;
+      SetLabel(PREFIX+"AE3", x, y,
+               StringFormat("Last Result: %s", g_LastTradeResult), resColor, FontSize);
+      y += dy;
+   }
+
    y += 4;
    // Last updated
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("Last updated: %s", TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS)),
+            StringFormat("v4.0 | Updated: %s | Magic: %d",
+                         TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS), MagicNumber),
             ColorNeutral, FontSize - 1);
 
    ChartRedraw(0);
