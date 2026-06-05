@@ -866,10 +866,16 @@ bool IsTradingAllowed() {
       g_BlockReason = StringFormat("Balance below floor ($%.2f)", MinBalanceUSD);
       return false;
    }
-   // Daily limits
+   // Daily profit target — high score (9 or 10) overrides and continues trading
    if(g_DailyProfitHit) {
-      g_BlockReason = StringFormat("Daily profit target hit: +%.2f%%  — Come back tomorrow", DailyProfitTarget);
-      return false;
+      int curScore = g_UseFallback ? g_FallbackScore : g_PrimaryScore;
+      if(UseScaledEntries && curScore >= ScaledScore2) {
+         g_BlockReason = "";  // Score 9+ overrides daily profit cap — keep trading
+      } else {
+         g_BlockReason = StringFormat("Daily profit target hit: +%.2f%% — Score %d below %d, no new trades",
+                                      g_DailyPnL, curScore, ScaledScore2);
+         return false;
+      }
    }
    if(g_DailyLossHit) {
       g_BlockReason = StringFormat("Daily loss limit hit: -%.2f%%  — Come back tomorrow", DailyLossLimit);
@@ -3165,10 +3171,14 @@ void UpdateDashboard() {
    string pnlBar  = "";
    int    bars2   = (int)MathMin(MathAbs(g_DailyPnL) * 4, 20);
    for(int b = 0; b < bars2; b++) pnlBar += "|";
+   int  curScorePnL = g_UseFallback ? g_FallbackScore : g_PrimaryScore;
+   bool profitOverride = g_DailyProfitHit && UseScaledEntries && curScorePnL >= ScaledScore2;
+   string profitNote = profitOverride ?
+      StringFormat("  !! Target hit but OVERRIDDEN — Score %d >= %d", curScorePnL, ScaledScore2) :
+      StringFormat("  Target: +%.1f%%  Limit: -%.1f%%", DailyProfitTarget, DailyLossLimit);
    SetLabel(PREFIX+"DS2", x, y,
-            StringFormat("Daily P&L: %+.2f%%  [%s]   Target: +%.1f%%  Limit: -%.1f%%",
-                         g_DailyPnL, pnlBar, DailyProfitTarget, DailyLossLimit),
-            pnlColor, FontSize);
+            StringFormat("Daily P&L: %+.2f%%  [%s]%s", g_DailyPnL, pnlBar, profitNote),
+            profitOverride ? ColorWarn : pnlColor, FontSize);
    y += dy;
 
    // Trade counters
