@@ -144,13 +144,10 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    double whArr[], wlArr[];
    ArraySetAsSeries(whArr, true);
    ArraySetAsSeries(wlArr, true);
-   if(CopyHigh(symbol, PERIOD_W1, 0, 3, whArr) >= 2) {
-      a.weeklyHigh = whArr[1];  // Previous week high
-      a.weeklyLow  = 0;
-   }
-   if(CopyLow(symbol, PERIOD_W1, 0, 3, wlArr) >= 2) {
-      a.weeklyLow = wlArr[1];   // Previous week low
-   }
+   if(CopyHigh(symbol, PERIOD_W1, 0, 3, whArr) >= 2)
+      a.weeklyHigh = whArr[1];
+   if(CopyLow(symbol, PERIOD_W1, 0, 3, wlArr) >= 2)
+      a.weeklyLow  = wlArr[1];
    // Daily
    double dhArr[], dlArr[];
    ArraySetAsSeries(dhArr, true);
@@ -223,12 +220,30 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    }
 
    //================================================================
+   // LIQUIDITY SWEEP — must be computed before MSS (MSS requires it)
+   //================================================================
+   a.hasLiqSweep = false;
+   a.sweepLevel  = 0;
+   {
+      int swLB = MathMin(15, lookback - 1);
+      for(int i = 1; i < swLB; i++) {
+         double psLow  = low [ArrayMinimum(low,  i+1, MathMin(10, lookback-i-1))];
+         double psHigh = high[ArrayMaximum(high, i+1, MathMin(10, lookback-i-1))];
+         if(a.bullish && low[i] < psLow && close[i] > psLow) {
+            a.hasLiqSweep = true; a.sweepLevel = psLow; break;
+         }
+         if(!a.bullish && high[i] > psHigh && close[i] < psHigh) {
+            a.hasLiqSweep = true; a.sweepLevel = psHigh; break;
+         }
+      }
+   }
+
+   //================================================================
    // MSS — Market Structure Shift (stronger than CHoCH)
-   // Requires CHoCH + displacement candle after sweep
+   // Requires CHoCH + liquidity sweep + displacement candle
    //================================================================
    a.hasMSS = false;
    if(a.hasCHoCH && a.hasLiqSweep) {
-      // Check if there is a large displacement candle after sweep
       for(int i = 1; i <= 5; i++) {
          double body = MathAbs(close[i] - open[i]);
          double range= high[i] - low[i];
@@ -396,23 +411,6 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
       double range = high[i] - low[i];
       if(range > 0 && body / range > 0.90) {
          a.hasVolumeImbalance = true; break;
-      }
-   }
-
-   //================================================================
-   // LIQUIDITY SWEEP
-   //================================================================
-   a.hasLiqSweep = false;
-   a.sweepLevel  = 0;
-   int swLB = MathMin(15, lookback - 1);
-   for(int i = 1; i < swLB; i++) {
-      double psLow  = low [ArrayMinimum(low,  i+1, MathMin(10, lookback-i-1))];
-      double psHigh = high[ArrayMaximum(high, i+1, MathMin(10, lookback-i-1))];
-      if(a.bullish && low[i] < psLow && close[i] > psLow) {
-         a.hasLiqSweep = true; a.sweepLevel = psLow; break;
-      }
-      if(!a.bullish && high[i] > psHigh && close[i] < psHigh) {
-         a.hasLiqSweep = true; a.sweepLevel = psHigh; break;
       }
    }
 

@@ -705,10 +705,10 @@ bool CheckCandleConfirmation(bool isBuy, ENUM_TIMEFRAMES tf) {
    ArraySetAsSeries(low,   true);
    ArraySetAsSeries(close, true);
 
-   if(CopyOpen (tf, 0, 3, open)  < 3 ||
-      CopyHigh (tf, 0, 3, high)  < 3 ||
-      CopyLow  (tf, 0, 3, low)   < 3 ||
-      CopyClose(tf, 0, 3, close) < 3) {
+   if(CopyOpen (_Symbol, tf, 0, 3, open)  < 3 ||
+      CopyHigh (_Symbol, tf, 0, 3, high)  < 3 ||
+      CopyLow  (_Symbol, tf, 0, 3, low)   < 3 ||
+      CopyClose(_Symbol, tf, 0, 3, close) < 3) {
       g_CandlePattern = "No data";
       return false;
    }
@@ -981,6 +981,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    // Find if this is a closing deal (entry = OUT)
    if(HistoryDealSelect(trans.deal)) {
+      // Only process deals opened by this EA
+      if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != MagicNumber) return;
+
       long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
       if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT) {
          double profit  = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
@@ -996,7 +999,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          if(idx >= 0) {
             TradeState ts       = g_Trades[idx];
             double exitPrice    = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
-            string strat        = g_UseFallback ? "FALLBACK" : "PRIMARY";
+            // Extract strategy from deal comment (set at entry time) for accuracy
+            string dealComment  = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+            string strat        = (StringFind(dealComment, "FALLBACK") >= 0) ? "FALLBACK" : "PRIMARY";
             double slPips       = MathAbs(ts.entryPrice - ts.initialSL) /
                                   (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
             double tradePips    = MathAbs(exitPrice - ts.entryPrice) /
@@ -1033,7 +1038,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             if(!g_IsTesting) {
                JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
                                  ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
-                                 ts.lotSize, ts.isBuy ? PrimaryRisk : FallbackRisk,
+                                 ts.lotSize, strat == "PRIMARY" ? PrimaryRisk : FallbackRisk,
                                  slPips, exitPrice, profit, ts.isBuy,
                                  ts.breakEvenDone, ts.partialTPDone, UseTrailingStop);
                SendTradeResultNotification(wasWin, profit, dealTicket, strat);
@@ -1258,7 +1263,8 @@ void ManageCapitalProtection() {
 
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(!PositionInfo.SelectByIndex(i)) continue;
-      if(PositionInfo.Symbol() != _Symbol) continue;
+      if(PositionInfo.Symbol() != _Symbol)   continue;
+      if(PositionInfo.Magic()  != MagicNumber) continue;
 
       ulong  ticket     = PositionInfo.Ticket();
       bool   isBuy      = (PositionInfo.PositionType() == POSITION_TYPE_BUY);
@@ -1288,8 +1294,9 @@ void ManageCapitalProtection() {
       if(UsePartialTP && !g_Trades[idx].partialTPDone) {
          double tp1Distance = slDistance * TP1_RR;
          if(profit >= tp1Distance) {
-            double closeVolume = NormalizeDouble(lots * PartialTPPercent / 100.0,
-                                                SymbolInfoInteger(_Symbol, SYMBOL_VOLUME_STEP) > 0 ? 2 : 2);
+            double lotStep_     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+            int    lotDigits_   = (lotStep_ >= 0.1) ? 1 : 2;
+            double closeVolume  = NormalizeDouble(lots * PartialTPPercent / 100.0, lotDigits_);
             closeVolume = MathMax(closeVolume, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
 
             if(closeVolume < lots) {
@@ -2738,7 +2745,7 @@ void GenerateHTMLReport() {
    html += TR("Max Spread Pips",      StringFormat("%.1f",   MaxSpreadPips));
    html += "</table>";
 
-   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v8.0 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
+   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v13.0 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
    html += "</body></html>";
 
    FileWriteString(fh, html);
