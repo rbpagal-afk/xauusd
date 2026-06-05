@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "4.00"
-#property description "XAUUSD Sniper EA — Auto Entry + Full Capital Protection"
+#property version     "5.00"
+#property description "XAUUSD Sniper EA — Chart Visuals + Journal + Notifications"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -69,6 +69,36 @@ input int              MagicNumber       = 202401; // EA magic number
 input double           SL_BufferPips     = 5.0;    // Extra pips beyond sweep for SL
 input int              CooldownBars      = 3;      // Bars to wait after last trade before new entry
 input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time
+
+input group            "=== CHART VISUALS ==="
+input bool             ShowOB            = true;   // Draw Order Block boxes on chart
+input bool             ShowFVG           = true;   // Draw FVG zones on chart
+input bool             ShowSweep         = true;   // Draw liquidity sweep lines
+input bool             ShowBOSArrows     = true;   // Mark BOS with arrows
+input bool             ShowCHoCHArrows   = true;   // Mark CHoCH with arrows
+input bool             ShowTradeLevels   = true;   // Draw SL/TP1/TP2 lines on chart
+input int              VisualMaxBars     = 100;    // How many bars back to draw visuals
+input color            ColorOB_Bull      = C'0,80,0';     // Bullish OB box color
+input color            ColorOB_Bear      = C'80,0,0';     // Bearish OB box color
+input color            ColorFVG_Bull     = C'0,60,60';    // Bullish FVG color
+input color            ColorFVG_Bear     = C'60,30,0';    // Bearish FVG color
+input color            ColorSweep        = clrMagenta;    // Sweep line color
+input color            ColorSL_Line      = clrRed;        // SL line color
+input color            ColorTP1_Line     = clrDodgerBlue; // TP1 line color
+input color            ColorTP2_Line     = clrLime;       // TP2 line color
+
+input group            "=== TRADE JOURNAL ==="
+input bool             UseJournal        = true;   // Save trades to CSV journal
+input string           JournalFileName   = "XAUUSD_Sniper_Journal.csv"; // Journal file name
+
+input group            "=== NOTIFICATIONS ==="
+input bool             UsePushAlert      = true;   // Send push notification to phone
+input bool             UseEmailAlert     = false;  // Send email on signal
+input bool             UseSoundAlert     = true;   // Play sound on signal
+input string           SoundBuy          = "news.wav";  // Sound for BUY signal
+input string           SoundSell         = "news.wav";  // Sound for SELL signal
+input string           SoundTP           = "ok.wav";    // Sound for TP hit
+input string           SoundSL           = "stops.wav"; // Sound for SL hit
 
 input group            "=== DASHBOARD ==="
 input int              Dashboard_X       = 20;     // Dashboard X position
@@ -164,11 +194,22 @@ double     g_LastLotSize       = 0;
 string     g_BlockReason       = "";     // Why trading is blocked
 
 //--- Auto entry state
-datetime   g_LastEntryBar      = 0;      // Bar time of last entry
-int        g_LastSignalScore   = 0;      // Score of last signal sent
-bool       g_AlertSent         = false;  // Alert already sent for this signal
-string     g_LastTradeResult   = "";     // Result of last closed trade
-string     g_EntryLog          = "";     // Last entry action log
+datetime   g_LastEntryBar      = 0;
+int        g_LastSignalScore   = 0;
+bool       g_AlertSent         = false;
+string     g_LastTradeResult   = "";
+string     g_EntryLog          = "";
+
+//--- Journal stats (all-time, loaded from file on init)
+int        g_TotalTrades       = 0;
+int        g_TotalWins         = 0;
+int        g_TotalLosses       = 0;
+double     g_TotalProfit       = 0;
+double     g_TotalLoss         = 0;
+string     g_JournalPath       = "";
+
+//--- Visual tracking — avoid redrawing every tick
+datetime   g_LastVisualBar     = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -178,8 +219,10 @@ int OnInit() {
    Trade.SetDeviationInPoints(MaxSlippagePips * 10);
    Trade.SetExpertMagicNumber(MagicNumber);
    ResetDailyTracking();
+   InitJournal();
    CreateDashboard();
    AnalyzeAllTimeframes();
+   DrawChartVisuals();
    UpdateDashboard();
    return INIT_SUCCEEDED;
 }
@@ -364,6 +407,7 @@ void OnTradeClose(bool wasWin) {
 void OnDeinit(const int reason) {
    EventKillTimer();
    DeleteDashboard();
+   ObjectsDeleteAll(0, "VIS_");
 }
 
 //+------------------------------------------------------------------+
@@ -375,6 +419,12 @@ void OnTick() {
    ManageCapitalProtection();
    AnalyzeAllTimeframes();
    TryAutoEntry();
+   // Redraw visuals only on new bar to save CPU
+   datetime curBar = iTime(_Symbol, TF_M15, 0);
+   if(curBar != g_LastVisualBar) {
+      DrawChartVisuals();
+      g_LastVisualBar = curBar;
+   }
    UpdateDashboard();
 }
 
@@ -393,14 +443,34 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(HistoryDealSelect(trans.deal)) {
       long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
       if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT) {
-         double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
-         bool   wasWin = (profit > 0);
+         double profit  = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+         bool   wasWin  = (profit > 0);
+         ulong  dealTicket = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
          OnTradeClose(wasWin);
          g_LastTradeResult = StringFormat("%s  $%.2f  (%s)",
                              TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES),
-                             profit,
-                             wasWin ? "WIN" : "LOSS");
-         // Reset alert flag so next signal can alert again
+                             profit, wasWin ? "WIN" : "LOSS");
+
+         // Find trade state for journal
+         int idx = FindTradeState(dealTicket);
+         if(idx >= 0) {
+            TradeState ts = g_Trades[idx];
+            double exitPrice = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+            string strat = g_UseFallback ? "FALLBACK" : "PRIMARY";
+            JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
+                              ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
+                              ts.lotSize, ts.isBuy ? PrimaryRisk : FallbackRisk,
+                              MathAbs(ts.entryPrice - ts.initialSL) /
+                              (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10),
+                              exitPrice, profit, ts.isBuy,
+                              ts.breakEvenDone, ts.partialTPDone, UseTrailingStop);
+            SendTradeResultNotification(wasWin, profit, dealTicket, strat);
+         }
+
+         // Notify if daily limit was just triggered
+         if(g_DailyLossHit || g_DailyProfitHit || g_ConsecLossHit)
+            SendDailyLimitNotification(g_BlockReason);
+
          g_AlertSent = false;
       }
    }
@@ -468,16 +538,12 @@ void TryAutoEntry() {
    string comment = StringFormat("Sniper %s %s Sc:%d", strategy, isBuy?"BUY":"SELL", score);
 
    // Alert regardless of AutoTrade setting
-   if(AlertOnSignal && !g_AlertSent) {
-      string msg = StringFormat(
-         "XAUUSD SNIPER SIGNAL\n%s %s\nScore: %d/13\nEntry: %.2f\nSL: %.2f (%.1f pips)\nTP1: %.2f  TP2: %.2f\nRisk: %.1f%%  Lots: %.2f",
-         strategy, isBuy ? "BUY" : "SELL", score,
-         entry, sl, slPips, tp1, tp2, riskPct, lots);
-      Alert(msg);
-      g_AlertSent     = true;
+   if(!g_AlertSent) {
+      SendSignalNotification(strategy, isBuy, score, entry, sl, tp1, tp2, riskPct, lots);
+      g_AlertSent       = true;
       g_LastSignalScore = score;
-      g_EntryLog = StringFormat("SIGNAL: %s %s | Score:%d | Entry:%.2f SL:%.2f TP2:%.2f | Lots:%.2f",
-                                strategy, isBuy?"BUY":"SELL", score, entry, sl, tp2, lots);
+      g_EntryLog = StringFormat("SIGNAL: %s %s | Score:%d | Entry:%.2f SL:%.2f TP1:%.2f TP2:%.2f | Lots:%.2f",
+                                strategy, isBuy?"BUY":"SELL", score, entry, sl, tp1, tp2, lots);
    }
 
    // Auto execute if enabled
@@ -958,12 +1024,352 @@ string GetRecommendation() {
 }
 
 //+------------------------------------------------------------------+
+//|  TRADE JOURNAL                                                   |
+//+------------------------------------------------------------------+
+
+void InitJournal() {
+   if(!UseJournal) return;
+   g_JournalPath = TerminalInfoString(TERMINAL_DATA_PATH) +
+                   "\\MQL5\\Files\\" + JournalFileName;
+
+   // Create file with header if it does not exist
+   if(!FileIsExist(JournalFileName, FILE_COMMON)) {
+      int fh = FileOpen(JournalFileName, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+      if(fh != INVALID_HANDLE) {
+         FileWrite(fh,
+            "Date", "Time(PHT)", "Symbol", "Direction", "Strategy",
+            "Score", "Entry", "SL", "TP1", "TP2",
+            "Lots", "Risk%", "SL_Pips", "Exit", "Profit_USD",
+            "Profit%", "RR_Achieved", "Result", "Session",
+            "BE_Used", "TP1_Hit", "Trail_Used");
+         FileClose(fh);
+      }
+   }
+   // Load stats from existing journal
+   LoadJournalStats();
+}
+
+void LoadJournalStats() {
+   int fh = FileOpen(JournalFileName, FILE_READ|FILE_CSV|FILE_COMMON, ',');
+   if(fh == INVALID_HANDLE) return;
+   FileReadString(fh); // Skip header line
+   while(!FileIsEnding(fh)) {
+      string line[22];
+      bool valid = true;
+      for(int i = 0; i < 22 && !FileIsEnding(fh); i++)
+         line[i] = FileReadString(fh);
+      if(line[0] == "") continue;
+      double profit = StringToDouble(line[14]);
+      g_TotalTrades++;
+      if(profit >= 0) { g_TotalWins++;   g_TotalProfit += profit; }
+      else            { g_TotalLosses++; g_TotalLoss   += MathAbs(profit); }
+   }
+   FileClose(fh);
+}
+
+void JournalWriteTrade(ulong ticket, string strategy, int score,
+                       double entry, double sl, double tp1, double tp2,
+                       double lots, double riskPct, double slPips,
+                       double exitPrice, double profitUSD,
+                       bool isBuy, bool beUsed, bool tp1Hit, bool trailUsed) {
+   if(!UseJournal) return;
+   int fh = FileOpen(JournalFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   if(fh == INVALID_HANDLE) return;
+   FileSeek(fh, 0, SEEK_END);
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int phtHour = (dt.hour + 8) % 24;
+
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double profitPct = balance > 0 ? (profitUSD / (balance - profitUSD)) * 100.0 : 0;
+   double rrAchieved = slPips > 0 ? MathAbs(exitPrice - entry) /
+                                    (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10 * slPips) : 0;
+   string result   = profitUSD >= 0 ? "WIN" : "LOSS";
+   string dir      = isBuy ? "BUY" : "SELL";
+
+   FileWrite(fh,
+      TimeToString(TimeCurrent(), TIME_DATE),
+      StringFormat("%02d:%02d PHT", phtHour, dt.min),
+      _Symbol, dir, strategy,
+      IntegerToString(score),
+      DoubleToString(entry,  _Digits),
+      DoubleToString(sl,     _Digits),
+      DoubleToString(tp1,    _Digits),
+      DoubleToString(tp2,    _Digits),
+      DoubleToString(lots,   2),
+      DoubleToString(riskPct, 1),
+      DoubleToString(slPips, 1),
+      DoubleToString(exitPrice, _Digits),
+      DoubleToString(profitUSD, 2),
+      DoubleToString(profitPct, 2),
+      DoubleToString(rrAchieved, 2),
+      result,
+      g_Session,
+      beUsed    ? "Yes" : "No",
+      tp1Hit    ? "Yes" : "No",
+      trailUsed ? "Yes" : "No");
+
+   FileClose(fh);
+
+   // Update in-memory stats
+   g_TotalTrades++;
+   if(profitUSD >= 0) { g_TotalWins++;   g_TotalProfit += profitUSD; }
+   else               { g_TotalLosses++; g_TotalLoss   += MathAbs(profitUSD); }
+}
+
+double GetProfitFactor() {
+   return g_TotalLoss > 0 ? g_TotalProfit / g_TotalLoss : 0;
+}
+
+double GetWinRate() {
+   return g_TotalTrades > 0 ? (double)g_TotalWins / g_TotalTrades * 100.0 : 0;
+}
+
+//+------------------------------------------------------------------+
+//|  CHART VISUALS                                                   |
+//+------------------------------------------------------------------+
+
+void DrawChartVisuals() {
+   // Clear old visual objects
+   ObjectsDeleteAll(0, "VIS_");
+
+   if(ShowOB)      DrawOrderBlocks();
+   if(ShowFVG)     DrawFVGZones();
+   if(ShowSweep)   DrawSweepLines();
+   if(ShowBOSArrows || ShowCHoCHArrows) DrawStructureArrows();
+   DrawTradeLevelLines();
+}
+
+void DrawOrderBlocks() {
+   // Draw H4 OB
+   if(g_H4.hasOB && g_H4.obHigh > 0)
+      DrawBox("VIS_OB_H4", TF_H4, g_H4.obHigh, g_H4.obLow,
+              g_H4.bullish ? ColorOB_Bull : ColorOB_Bear, "H4 OB");
+   // Draw H1 OB
+   if(g_H1.hasOB && g_H1.obHigh > 0)
+      DrawBox("VIS_OB_H1", TF_H1, g_H1.obHigh, g_H1.obLow,
+              g_H1.bullish ? ColorOB_Bull : ColorOB_Bear, "H1 OB");
+   // Draw M15 OB
+   if(g_M15.hasOB && g_M15.obHigh > 0)
+      DrawBox("VIS_OB_M15", TF_M15, g_M15.obHigh, g_M15.obLow,
+              g_M15.bullish ? ColorOB_Bull : ColorOB_Bear, "M15 OB");
+}
+
+void DrawBox(string name, ENUM_TIMEFRAMES tf, double hi, double lo,
+             color clr, string label) {
+   datetime t1 = iTime(_Symbol, tf, OB_Lookback);
+   datetime t2 = iTime(_Symbol, tf, 0) + PeriodSeconds(tf) * 20;
+
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, hi, t2, lo);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
+   ObjectSetInteger(0, name, OBJPROP_FILL,    true);
+   ObjectSetInteger(0, name, OBJPROP_BACK,    true);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,   STYLE_SOLID);
+   ObjectSetString (0, name, OBJPROP_TEXT,    label);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+void DrawFVGZones() {
+   DrawFVGForTF(TF_H4,  "VIS_FVG_H4",  g_H4,  "H4 FVG");
+   DrawFVGForTF(TF_H1,  "VIS_FVG_H1",  g_H1,  "H1 FVG");
+   DrawFVGForTF(TF_M15, "VIS_FVG_M15", g_M15, "M15 FVG");
+   DrawFVGForTF(TF_M5,  "VIS_FVG_M5",  g_M5,  "M5 FVG");
+}
+
+void DrawFVGForTF(ENUM_TIMEFRAMES tf, string name,
+                  TFAnalysis &a, string label) {
+   if(!a.hasFVG) return;
+
+   double high[], low[];
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low,  true);
+   int lookback = MathMin(FVG_Lookback + 3, 20);
+   if(CopyHigh(_Symbol, tf, 0, lookback, high) < lookback) return;
+   if(CopyLow (_Symbol, tf, 0, lookback, low)  < lookback) return;
+
+   // Find FVG zone boundaries
+   for(int i = 1; i < lookback - 1; i++) {
+      double fvgHi = 0, fvgLo = 0;
+      if(a.bullish && low[i-1] > high[i+1]) {
+         fvgHi = low[i-1];
+         fvgLo = high[i+1];
+      } else if(!a.bullish && high[i-1] < low[i+1]) {
+         fvgHi = low[i+1];
+         fvgLo = high[i-1];
+      }
+      if(fvgHi > 0 && fvgLo > 0) {
+         datetime t1 = iTime(_Symbol, tf, i + 1);
+         datetime t2 = iTime(_Symbol, tf, 0) + PeriodSeconds(tf) * 15;
+         if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, fvgHi, t2, fvgLo);
+         color clr = a.bullish ? ColorFVG_Bull : ColorFVG_Bear;
+         ObjectSetInteger(0, name, OBJPROP_COLOR,      clr);
+         ObjectSetInteger(0, name, OBJPROP_FILL,       true);
+         ObjectSetInteger(0, name, OBJPROP_BACK,       true);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+         ObjectSetString (0, name, OBJPROP_TEXT,       label);
+         break;
+      }
+   }
+}
+
+void DrawSweepLines() {
+   DrawSweepForTF(TF_H1,  "VIS_SW_H1",  g_H1,  "H1 Sweep");
+   DrawSweepForTF(TF_M15, "VIS_SW_M15", g_M15, "M15 Sweep");
+   DrawSweepForTF(TF_M5,  "VIS_SW_M5",  g_M5,  "M5 Sweep");
+}
+
+void DrawSweepForTF(ENUM_TIMEFRAMES tf, string name,
+                    TFAnalysis &a, string label) {
+   if(!a.hasLiqSweep) return;
+   double arr[];
+   ArraySetAsSeries(arr, true);
+   int lookback = MathMin(Sweep_Lookback + 2, 20);
+   double level = 0;
+
+   if(a.bullish) {
+      if(CopyLow(_Symbol, tf, 1, lookback, arr) < lookback) return;
+      level = arr[ArrayMinimum(arr, 0, lookback)];
+   } else {
+      if(CopyHigh(_Symbol, tf, 1, lookback, arr) < lookback) return;
+      level = arr[ArrayMaximum(arr, 0, lookback)];
+   }
+   if(level <= 0) return;
+
+   datetime t1 = iTime(_Symbol, tf, lookback);
+   datetime t2 = iTime(_Symbol, tf, 0) + PeriodSeconds(tf) * 10;
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_TREND, 0, t1, level, t2, level);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      ColorSweep);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,      STYLE_DOT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,       1);
+   ObjectSetString (0, name, OBJPROP_TEXT,        label);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT,   false);
+}
+
+void DrawStructureArrows() {
+   // BOS arrows on H4
+   if(ShowBOSArrows && g_H4.hasBOS) {
+      string name = "VIS_BOS_H4";
+      if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+      ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_H4, 1),
+                   g_H4.bullish ? iLow(_Symbol, TF_H4, 1) - 200 * _Point
+                                : iHigh(_Symbol, TF_H4, 1) + 200 * _Point);
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_H4.bullish ? 233 : 234);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     g_H4.bullish ? ColorBull : ColorBear);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
+      ObjectSetString (0, name, OBJPROP_TEXT,       "BOS H4");
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+   // CHoCH arrows on H1
+   if(ShowCHoCHArrows && g_H1.hasCHoCH) {
+      string name = "VIS_CHOCH_H1";
+      if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+      ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_H1, 1),
+                   g_H1.bullish ? iLow(_Symbol, TF_H1, 1) - 150 * _Point
+                                : iHigh(_Symbol, TF_H1, 1) + 150 * _Point);
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_H1.bullish ? 233 : 234);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrAqua);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
+      ObjectSetString (0, name, OBJPROP_TEXT,       "CHoCH H1");
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+   // CHoCH on M15
+   if(ShowCHoCHArrows && g_M15.hasCHoCH) {
+      string name = "VIS_CHOCH_M15";
+      if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+      ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_M15, 1),
+                   g_M15.bullish ? iLow(_Symbol, TF_M15, 1) - 100 * _Point
+                                 : iHigh(_Symbol, TF_M15, 1) + 100 * _Point);
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_M15.bullish ? 233 : 234);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrYellow);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
+      ObjectSetString (0, name, OBJPROP_TEXT,       "CHoCH M15");
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+}
+
+void DrawTradeLevelLines() {
+   if(!ShowTradeLevels) return;
+   // Remove old trade lines first
+   ObjectsDeleteAll(0, "VIS_TL_");
+   // Draw lines for each open trade
+   for(int t = 0; t < ArraySize(g_Trades); t++) {
+      TradeState ts = g_Trades[t];
+      datetime   t1 = TimeCurrent() - PeriodSeconds(PERIOD_H1) * 4;
+      datetime   t2 = TimeCurrent() + PeriodSeconds(PERIOD_H1) * 8;
+      string     pfx = "VIS_TL_" + IntegerToString(ts.ticket);
+
+      DrawHLine(pfx + "_SL",  ts.initialSL, ColorSL_Line,  STYLE_SOLID, 2, "SL");
+      DrawHLine(pfx + "_TP1", ts.tp1Price,  ColorTP1_Line, STYLE_DASH,  1, "TP1");
+      DrawHLine(pfx + "_TP2", ts.tp2Price,  ColorTP2_Line, STYLE_SOLID, 1, "TP2");
+      DrawHLine(pfx + "_EN",  ts.entryPrice, clrWhite,     STYLE_DOT,   1, "Entry");
+   }
+}
+
+void DrawHLine(string name, double price, color clr,
+               ENUM_LINE_STYLE style, int width, string label) {
+   if(price <= 0) return;
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,      style);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,       width);
+   ObjectSetString (0, name, OBJPROP_TEXT,        label);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,        true);
+}
+
+//+------------------------------------------------------------------+
+//|  NOTIFICATIONS                                                   |
+//+------------------------------------------------------------------+
+
+void SendSignalNotification(string strategy, bool isBuy, int score,
+                            double entry, double sl, double tp1,
+                            double tp2, double lots, double riskPct) {
+   string dir  = isBuy ? "BUY" : "SELL";
+   string msg  = StringFormat(
+      "XAUUSD SNIPER | %s %s\nScore: %d/13 | %s\nEntry: %.2f\nSL: %.2f | TP1: %.2f | TP2: %.2f\nRisk: %.1f%% | Lots: %.2f",
+      strategy, dir, score, g_Session,
+      entry, sl, tp1, tp2, riskPct, lots);
+
+   if(AlertOnSignal)  Alert(msg);
+   if(UsePushAlert)   SendNotification(msg);
+   if(UseEmailAlert)  SendMail("XAUUSD Sniper Signal: " + strategy + " " + dir, msg);
+   if(UseSoundAlert)  PlaySound(isBuy ? SoundBuy : SoundSell);
+}
+
+void SendTradeResultNotification(bool isWin, double profitUSD,
+                                 ulong ticket, string strategy) {
+   string msg = StringFormat(
+      "XAUUSD SNIPER | Trade %s\n#%d %s\nProfit: %s$%.2f\nWin Rate: %.1f%% | Profit Factor: %.2f",
+      isWin ? "WIN" : "LOSS", ticket, strategy,
+      profitUSD >= 0 ? "+" : "", profitUSD,
+      GetWinRate(), GetProfitFactor());
+
+   if(UsePushAlert)  SendNotification(msg);
+   if(UseSoundAlert) PlaySound(isWin ? SoundTP : SoundSL);
+}
+
+void SendDailyLimitNotification(string reason) {
+   string msg = StringFormat(
+      "XAUUSD SNIPER | Trading Stopped\n%s\nDaily P&L: %+.2f%%\nWins: %d | Losses: %d",
+      reason, g_DailyPnL, g_TotalWins, g_TotalLosses);
+   if(UsePushAlert)  SendNotification(msg);
+   if(AlertOnSignal) Alert(msg);
+}
+
+//+------------------------------------------------------------------+
 //| Dashboard creation — all labels                                 |
 //+------------------------------------------------------------------+
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 54 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 64 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -1231,10 +1637,71 @@ void UpdateDashboard() {
       y += dy;
    }
 
+   // ── PERFORMANCE STATS ──
+   y += dy;
+   SetLabel(PREFIX+"STH", x, y, "── PERFORMANCE STATS (All-Time) ──", ColorHeader, FontSize);
+   y += dy;
+
+   double winRate = GetWinRate();
+   double pf      = GetProfitFactor();
+   double netPnL  = g_TotalProfit - g_TotalLoss;
+   color  statsClr = netPnL >= 0 ? ColorBull : ColorBear;
+
+   SetLabel(PREFIX+"ST1", x, y,
+            StringFormat("Trades: %d  |  Wins: %d  |  Losses: %d  |  Win Rate: %.1f%%",
+                         g_TotalTrades, g_TotalWins, g_TotalLosses, winRate),
+            statsClr, FontSize);
+   y += dy;
+
+   SetLabel(PREFIX+"ST2", x, y,
+            StringFormat("Net P&L: $%.2f  |  Profit Factor: %.2f  |  Gross Win: $%.2f  |  Gross Loss: $%.2f",
+                         netPnL, pf, g_TotalProfit, g_TotalLoss),
+            statsClr, FontSize);
+   y += dy;
+
+   // Journal status
+   string jStatus = UseJournal ? StringFormat("Journal: ON  (%s)", JournalFileName)
+                               : "Journal: OFF";
+   SetLabel(PREFIX+"ST3", x, y, jStatus, ColorNeutral, FontSize);
+   y += dy;
+
+   // ── NOTIFICATIONS ──
+   y += dy;
+   SetLabel(PREFIX+"NTH", x, y, "── NOTIFICATIONS ──", ColorHeader, FontSize);
+   y += dy;
+
+   string pushStr  = UsePushAlert    ? "Push:ON"   : "Push:OFF";
+   string emailStr = UseEmailAlert   ? "Email:ON"  : "Email:OFF";
+   string soundStr = UseSoundAlert   ? "Sound:ON"  : "Sound:OFF";
+   string alertStr = AlertOnSignal   ? "Alert:ON"  : "Alert:OFF";
+
+   SetLabel(PREFIX+"NT1a", x,       y, pushStr,  UsePushAlert   ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"NT1b", x + 90,  y, emailStr, UseEmailAlert  ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"NT1c", x + 180, y, soundStr, UseSoundAlert  ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"NT1d", x + 270, y, alertStr, AlertOnSignal  ? ColorBull : ColorNeutral, FontSize);
+   y += dy;
+
+   // ── CHART VISUALS ──
+   y += dy;
+   SetLabel(PREFIX+"CVH", x, y, "── CHART VISUALS ──", ColorHeader, FontSize);
+   y += dy;
+
+   string obStr    = ShowOB         ? "OB:ON"     : "OB:OFF";
+   string fvgStr   = ShowFVG        ? "FVG:ON"    : "FVG:OFF";
+   string swStr    = ShowSweep      ? "Sweep:ON"  : "Sweep:OFF";
+   string bosStr   = ShowBOSArrows  ? "BOS:ON"    : "BOS:OFF";
+   string tlStr    = ShowTradeLevels ? "Levels:ON" : "Levels:OFF";
+
+   SetLabel(PREFIX+"CV1a", x,       y, obStr,  ShowOB          ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1b", x + 75,  y, fvgStr, ShowFVG         ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1c", x + 150, y, swStr,  ShowSweep       ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1d", x + 235, y, bosStr, ShowBOSArrows   ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1e", x + 310, y, tlStr,  ShowTradeLevels ? ColorBull : ColorNeutral, FontSize);
+   y += dy;
+
    y += 4;
-   // Last updated
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v4.0 | Updated: %s | Magic: %d",
+            StringFormat("v5.0 | %s | Magic: %d",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS), MagicNumber),
             ColorNeutral, FontSize - 1);
 
