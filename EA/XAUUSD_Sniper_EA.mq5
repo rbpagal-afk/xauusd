@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "10.00"
-#property description "XAUUSD Sniper EA — MT5 Live News Calendar v10.0"
+#property version     "11.00"
+#property description "XAUUSD Sniper EA — Adaptive Learning System v11.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -141,6 +141,14 @@ input group            "=== REPORT ==="
 input bool             GenerateReport    = true;   // Generate HTML report on backtest end
 input string           ReportFileName    = "XAUUSD_Sniper_Report.html"; // Report file name
 
+input group            "=== ADAPTIVE LEARNING ==="
+input bool             UseAdaptiveLearning = true;  // EA self-adjusts score thresholds from trade results
+input int              LearningBatchSize   = 20;    // Trades per review cycle before adjusting thresholds
+input int              MinTradesForAdjust  = 10;    // Minimum trades needed before any adjustment
+input double           MinSessionWinRate   = 45.0;  // Suspend a session if win rate falls below this %
+input bool             SuspendBadSessions  = true;  // Auto-suspend sessions with poor win rate
+input string           LearningFileName    = "XAUUSD_Sniper_Learning.dat"; // Learning data save file
+
 input group            "=== OPTIMIZATION TARGETS ==="
 // These are the parameters the Strategy Tester will vary during optimization
 // In MT5: right-click each input → check Optimize checkbox
@@ -242,6 +250,57 @@ string     g_DXY_Status        = "N/A";  // Human-readable DXY status
 bool       g_CandleConfirmed   = false;  // Latest candle confirmation result
 string     g_CandlePattern     = "None"; // Pattern detected: Engulf / PinBar / None
 
+//+------------------------------------------------------------------+
+//| Adaptive Learning — confluence snapshot at trade entry          |
+//+------------------------------------------------------------------+
+#define CONFLUENCE_COUNT 20
+#define SESSION_COUNT     4
+
+string g_ConfluenceNames[CONFLUENCE_COUNT] = {
+   "H4 ExtBOS",  "H4 MSS",       "H4 FreshOB",  "H4 AtSR",
+   "H4 EqualHL", "H1 CHoCH",     "H1 MSS",      "H1 OB+Sweep",
+   "H1 OpenFVG", "H1 OTE",       "H1 Displace",  "M15 Sweep",
+   "M15 CHoCH",  "M15 OpenFVG",  "M15 FreshOB", "M15 Judas",
+   "SilverBull", "DXY Aligned",  "CandleConf",  "Key Session"
+};
+
+string g_SessionNames[SESSION_COUNT] = {
+   "London Open", "London Mid", "NY Open", "Other"
+};
+
+struct ConfluenceStats {
+   int presentWins;   // Wins when this confluence WAS present
+   int presentTotal;  // Total trades when this confluence WAS present
+   int absentWins;    // Wins when this confluence was NOT present
+   int absentTotal;   // Total trades when this confluence was NOT present
+};
+
+struct SessionStats {
+   int  wins;
+   int  total;
+   bool suspended;    // Auto-suspended due to low win rate
+};
+
+struct TradeSnapshot {
+   ulong  ticket;
+   bool   confluences[CONFLUENCE_COUNT]; // Which confluences were active at entry
+   int    sessionIdx;                    // Which session trade was taken in
+   string strategy;                      // PRIMARY or FALLBACK
+};
+
+//--- Learning state
+ConfluenceStats g_ConfStats[CONFLUENCE_COUNT];
+SessionStats    g_SessStats[SESSION_COUNT];
+TradeSnapshot   g_Snapshots[];           // Parallel array with g_Trades
+
+//--- Dynamic thresholds (start at input values, self-adjust over time)
+int    g_DynPrimaryScore  = 0;   // Initialized from MinPrimaryScore in OnInit
+int    g_DynFallbackScore = 0;   // Initialized from MinFallbackScore in OnInit
+int    g_PrimaryWins      = 0;
+int    g_FallbackWins     = 0;
+int    g_BatchTradeCount  = 0;   // Counts toward next adjustment cycle
+string g_LearnStatus      = "Learning: accumulating trades...";
+
 //--- Lot size calculator state
 double     g_LastLotSize       = 0;
 string     g_BlockReason       = "";     // Why trading is blocked
@@ -321,6 +380,12 @@ int OnInit() {
    ResetDailyTracking();
    ResetWeeklyTracking();
    ResetMonthlyTracking();
+
+   // Initialize adaptive learning
+   g_DynPrimaryScore  = MinPrimaryScore;
+   g_DynFallbackScore = MinFallbackScore;
+   ArrayInitialize(g_Snapshots, 0);
+   if(!g_IsTesting) LoadLearningData();
 
    if(!g_IsTesting) InitJournal();
 
@@ -913,6 +978,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             if(strat == "PRIMARY")  g_PrimaryTrades++;
             else                    g_FallbackTrades++;
 
+            // Update adaptive learning stats
+            UpdateLearningStats(dealTicket, wasWin, strat);
+
             if(!g_IsTesting) {
                JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
                                  ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
@@ -952,8 +1020,19 @@ void TryAutoEntry() {
    if(OneTradeAtATime && CountOpenTrades() > 0) return;
 
    // Determine which strategy triggered
-   bool   primaryReady  = (g_PrimaryScore  >= MinPrimaryScore);
-   bool   fallbackReady = (g_FallbackScore >= MinFallbackScore) && !primaryReady;
+   // Use dynamic thresholds (self-adjusted by learning system)
+   int    effectivePrimScore  = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
+   int    effectiveFallScore  = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
+
+   // Check session suspension
+   if(IsSessionSuspended()) {
+      g_EntryLog = StringFormat("SESSION SUSPENDED: %s has low win rate — learning system paused trading",
+                                g_Session);
+      return;
+   }
+
+   bool   primaryReady  = (g_PrimaryScore  >= effectivePrimScore);
+   bool   fallbackReady = (g_FallbackScore >= effectiveFallScore) && !primaryReady;
    if(!primaryReady && !fallbackReady) { g_AlertSent = false; return; }
 
    bool   isBuy     = primaryReady ? g_H4.bullish : g_H1.bullish;
@@ -1030,9 +1109,12 @@ void TryAutoEntry() {
 
    if(ok) {
       g_LastEntryBar = currentBar;
+      ulong newTicket = Trade.ResultOrder();
       g_EntryLog = StringFormat("ENTERED: %s %s | Score:%d | Entry:%.2f SL:%.2f TP2:%.2f | Lots:%.2f | #%d",
                                 strategy, isBuy?"BUY":"SELL", score,
-                                entry, sl, tp2, lots, Trade.ResultOrder());
+                                entry, sl, tp2, lots, newTicket);
+      // Capture confluence snapshot for learning
+      if(UseAdaptiveLearning) RegisterSnapshot(newTicket, strategy);
    } else {
       g_EntryLog = StringFormat("ENTRY FAILED: Error %d — %s",
                                 Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
@@ -1283,6 +1365,264 @@ string GetSession() {
 }
 
 //+------------------------------------------------------------------+
+//| ADAPTIVE LEARNING FUNCTIONS                                     |
+//+------------------------------------------------------------------+
+
+//--- Capture confluence state at the moment a trade is entered
+TradeSnapshot CaptureSnapshot(ulong ticket, string strategy) {
+   TradeSnapshot snap;
+   snap.ticket   = ticket;
+   snap.strategy = strategy;
+
+   // Capture all 20 confluence flags
+   snap.confluences[0]  = g_H4.hasExternalBOS;
+   snap.confluences[1]  = g_H4.hasMSS;
+   snap.confluences[2]  = g_H4.hasFreshOB;
+   snap.confluences[3]  = g_H4.atKeySR;
+   snap.confluences[4]  = (g_H4.hasEqualHighs || g_H4.hasEqualLows);
+   snap.confluences[5]  = g_H1.hasCHoCH;
+   snap.confluences[6]  = g_H1.hasMSS;
+   snap.confluences[7]  = (g_H1.hasFreshOB && g_H1.hasLiqSweep);
+   snap.confluences[8]  = g_H1.hasFVGOpen;
+   snap.confluences[9]  = g_H1.inOTE;
+   snap.confluences[10] = g_H1.hasDisplacement;
+   snap.confluences[11] = g_M15.hasLiqSweep;
+   snap.confluences[12] = (g_M15.hasCHoCH || g_M15.hasMSS);
+   snap.confluences[13] = g_M15.hasFVGOpen;
+   snap.confluences[14] = g_M15.hasFreshOB;
+   snap.confluences[15] = g_M15.isJudasSwing;
+   snap.confluences[16] = g_M15.inSilverBullet;
+   snap.confluences[17] = g_DXY_Available ? !g_DXY_Bullish : false;
+   snap.confluences[18] = g_CandleConfirmed;
+   snap.confluences[19] = (g_Session == "London Open — TRADE WINDOW 1" ||
+                           g_Session == "New York Open — TRADE WINDOW 2 (BEST)");
+
+   // Determine session index
+   if(g_Session == "London Open — TRADE WINDOW 1")           snap.sessionIdx = 0;
+   else if(g_Session == "London Session (Selective)")         snap.sessionIdx = 1;
+   else if(g_Session == "New York Open — TRADE WINDOW 2 (BEST)") snap.sessionIdx = 2;
+   else                                                        snap.sessionIdx = 3;
+
+   return snap;
+}
+
+//--- Store snapshot alongside trade
+void RegisterSnapshot(ulong ticket, string strategy) {
+   int idx = ArraySize(g_Snapshots);
+   ArrayResize(g_Snapshots, idx + 1);
+   g_Snapshots[idx] = CaptureSnapshot(ticket, strategy);
+}
+
+//--- Find snapshot by ticket
+int FindSnapshot(ulong ticket) {
+   for(int i = 0; i < ArraySize(g_Snapshots); i++)
+      if(g_Snapshots[i].ticket == ticket) return i;
+   return -1;
+}
+
+//--- Remove snapshot by index
+void RemoveSnapshot(int idx) {
+   int n = ArraySize(g_Snapshots);
+   for(int i = idx; i < n - 1; i++)
+      g_Snapshots[i] = g_Snapshots[i + 1];
+   ArrayResize(g_Snapshots, n - 1);
+}
+
+//--- Update confluence and session stats after a trade closes
+void UpdateLearningStats(ulong ticket, bool wasWin, string strategy) {
+   if(!UseAdaptiveLearning) return;
+
+   int snapIdx = FindSnapshot(ticket);
+   if(snapIdx < 0) return;
+
+   TradeSnapshot snap = g_Snapshots[snapIdx];
+
+   // Update confluence stats
+   for(int i = 0; i < CONFLUENCE_COUNT; i++) {
+      if(snap.confluences[i]) {
+         g_ConfStats[i].presentTotal++;
+         if(wasWin) g_ConfStats[i].presentWins++;
+      } else {
+         g_ConfStats[i].absentTotal++;
+         if(wasWin) g_ConfStats[i].absentWins++;
+      }
+   }
+
+   // Update session stats
+   int si = snap.sessionIdx;
+   g_SessStats[si].total++;
+   if(wasWin) g_SessStats[si].wins++;
+
+   // Check session suspension
+   if(SuspendBadSessions && g_SessStats[si].total >= MinTradesForAdjust) {
+      double wr = (double)g_SessStats[si].wins / g_SessStats[si].total * 100.0;
+      g_SessStats[si].suspended = (wr < MinSessionWinRate);
+   }
+
+   // Update per-strategy win counters
+   if(strategy == "PRIMARY") {
+      if(wasWin) g_PrimaryWins++;
+   } else {
+      if(wasWin) g_FallbackWins++;
+   }
+
+   g_BatchTradeCount++;
+
+   // Threshold adjustment after each batch
+   if(g_BatchTradeCount >= LearningBatchSize)
+      AdjustThresholds();
+
+   // Save updated data
+   RemoveSnapshot(snapIdx);
+   if(!g_IsTesting) SaveLearningData();
+}
+
+//--- Self-adjust score thresholds based on recent performance
+void AdjustThresholds() {
+   g_BatchTradeCount = 0;
+
+   // Primary threshold adjustment
+   if(g_PrimaryTrades >= MinTradesForAdjust) {
+      double primWR = (double)g_PrimaryWins / g_PrimaryTrades * 100.0;
+      if(primWR < 40.0 && g_DynPrimaryScore < MinPrimaryScore + 5)
+         g_DynPrimaryScore++;   // Losing too much — raise the bar
+      else if(primWR > 70.0 && g_DynPrimaryScore > MinPrimaryScore - 2)
+         g_DynPrimaryScore--;   // Winning well — can afford slightly lower bar
+   }
+
+   // Fallback threshold adjustment
+   if(g_FallbackTrades >= MinTradesForAdjust) {
+      double fallWR = (double)g_FallbackWins / g_FallbackTrades * 100.0;
+      if(fallWR < 40.0 && g_DynFallbackScore < MinFallbackScore + 5)
+         g_DynFallbackScore++;
+      else if(fallWR > 70.0 && g_DynFallbackScore > MinFallbackScore - 2)
+         g_DynFallbackScore--;
+   }
+
+   // Clamp to safe bounds
+   g_DynPrimaryScore  = MathMax(5,  MathMin(20, g_DynPrimaryScore));
+   g_DynFallbackScore = MathMax(7,  MathMin(22, g_DynFallbackScore));
+
+   // Build status string
+   double primWR  = g_PrimaryTrades  > 0 ? (double)g_PrimaryWins  / g_PrimaryTrades  * 100.0 : 0;
+   double fallWR  = g_FallbackTrades > 0 ? (double)g_FallbackWins / g_FallbackTrades * 100.0 : 0;
+   g_LearnStatus = StringFormat(
+      "Primary WR: %.1f%%  Score→%d  |  Fallback WR: %.1f%%  Score→%d  |  Trades reviewed: %d",
+      primWR, g_DynPrimaryScore, fallWR, g_DynFallbackScore,
+      g_PrimaryTrades + g_FallbackTrades);
+}
+
+//--- Get confluence win rate when present (returns -1 if no data)
+double ConfluenceWinRate(int idx) {
+   if(g_ConfStats[idx].presentTotal < 3) return -1;
+   return (double)g_ConfStats[idx].presentWins / g_ConfStats[idx].presentTotal * 100.0;
+}
+
+//--- Get confluence value score (win rate present minus win rate absent)
+double ConfluenceValue(int idx) {
+   double wrPresent = g_ConfStats[idx].presentTotal >= 3 ?
+                      (double)g_ConfStats[idx].presentWins / g_ConfStats[idx].presentTotal * 100.0 : 50.0;
+   double wrAbsent  = g_ConfStats[idx].absentTotal  >= 3 ?
+                      (double)g_ConfStats[idx].absentWins  / g_ConfStats[idx].absentTotal  * 100.0 : 50.0;
+   return wrPresent - wrAbsent;
+}
+
+//--- Check if current session is suspended by learning system
+bool IsSessionSuspended() {
+   if(!UseAdaptiveLearning || !SuspendBadSessions) return false;
+   int si = 3; // default Other
+   if(g_Session == "London Open — TRADE WINDOW 1")            si = 0;
+   else if(g_Session == "London Session (Selective)")          si = 1;
+   else if(g_Session == "New York Open — TRADE WINDOW 2 (BEST)") si = 2;
+   return g_SessStats[si].suspended;
+}
+
+//--- Save all learning data to file
+void SaveLearningData() {
+   int fh = FileOpen(LearningFileName, FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+
+   // Header
+   FileWriteString(fh, "XAUUSD_SNIPER_LEARNING_V1\n");
+
+   // Dynamic thresholds
+   FileWriteString(fh, StringFormat("THRESH,%d,%d,%d,%d,%d,%d\n",
+      g_DynPrimaryScore, g_DynFallbackScore,
+      g_PrimaryTrades, g_PrimaryWins,
+      g_FallbackTrades, g_FallbackWins));
+
+   // Confluence stats
+   for(int i = 0; i < CONFLUENCE_COUNT; i++) {
+      FileWriteString(fh, StringFormat("CONF,%d,%d,%d,%d,%d\n",
+         i,
+         g_ConfStats[i].presentWins,  g_ConfStats[i].presentTotal,
+         g_ConfStats[i].absentWins,   g_ConfStats[i].absentTotal));
+   }
+
+   // Session stats
+   for(int i = 0; i < SESSION_COUNT; i++) {
+      FileWriteString(fh, StringFormat("SESS,%d,%d,%d,%d\n",
+         i, g_SessStats[i].wins, g_SessStats[i].total,
+         g_SessStats[i].suspended ? 1 : 0));
+   }
+
+   FileClose(fh);
+}
+
+//--- Load learning data from file
+void LoadLearningData() {
+   if(!FileIsExist(LearningFileName, FILE_COMMON)) return;
+
+   int fh = FileOpen(LearningFileName, FILE_READ|FILE_TXT|FILE_COMMON);
+   if(fh == INVALID_HANDLE) return;
+
+   // Check header
+   string header = FileReadString(fh);
+   if(StringFind(header, "XAUUSD_SNIPER_LEARNING") < 0) { FileClose(fh); return; }
+
+   while(!FileIsEnding(fh)) {
+      string line = FileReadString(fh);
+      if(StringLen(line) == 0) continue;
+
+      string parts[];
+      int n = StringSplit(line, ',', parts);
+      if(n < 2) continue;
+
+      string tag = parts[0];
+
+      if(tag == "THRESH" && n >= 7) {
+         g_DynPrimaryScore  = (int)StringToInteger(parts[1]);
+         g_DynFallbackScore = (int)StringToInteger(parts[2]);
+         g_PrimaryTrades    = (int)StringToInteger(parts[3]);
+         g_PrimaryWins      = (int)StringToInteger(parts[4]);
+         g_FallbackTrades   = (int)StringToInteger(parts[5]);
+         g_FallbackWins     = (int)StringToInteger(parts[6]);
+      }
+      else if(tag == "CONF" && n >= 6) {
+         int idx = (int)StringToInteger(parts[1]);
+         if(idx >= 0 && idx < CONFLUENCE_COUNT) {
+            g_ConfStats[idx].presentWins  = (int)StringToInteger(parts[2]);
+            g_ConfStats[idx].presentTotal = (int)StringToInteger(parts[3]);
+            g_ConfStats[idx].absentWins   = (int)StringToInteger(parts[4]);
+            g_ConfStats[idx].absentTotal  = (int)StringToInteger(parts[5]);
+         }
+      }
+      else if(tag == "SESS" && n >= 5) {
+         int idx = (int)StringToInteger(parts[1]);
+         if(idx >= 0 && idx < SESSION_COUNT) {
+            g_SessStats[idx].wins      = (int)StringToInteger(parts[2]);
+            g_SessStats[idx].total     = (int)StringToInteger(parts[3]);
+            g_SessStats[idx].suspended = (StringToInteger(parts[4]) == 1);
+         }
+      }
+   }
+
+   FileClose(fh);
+   g_LearnStatus = StringFormat("Learning data loaded — %d primary, %d fallback trades",
+                                g_PrimaryTrades, g_FallbackTrades);
+}
+
+//+------------------------------------------------------------------+
 //| Build trade recommendation                                       |
 //+------------------------------------------------------------------+
 string GetRecommendation() {
@@ -1297,28 +1637,36 @@ string GetRecommendation() {
    if(!inTradeSession)
       return "NOT IN TRADING SESSION — PREPARE ONLY";
 
+   int effPrim = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
+   int effFall = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
+
+   // Check session suspension
+   if(IsSessionSuspended())
+      return StringFormat("SESSION SUSPENDED by learning system — %s below %.0f%% win rate",
+                          g_Session, MinSessionWinRate);
+
    // Primary strategy
-   if(g_PrimaryScore >= MinPrimaryScore) {
+   if(g_PrimaryScore >= effPrim) {
       string dir   = g_H4.bullish ? "BUY" : "SELL";
-      double slPips = 15.0; // Estimated — replaced by actual SL on entry
+      double slPips = 15.0;
       double lots   = CalcLotSize(PrimaryRisk, slPips);
       g_LastLotSize = lots;
-      return StringFormat("PRIMARY TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f",
-                          dir, g_PrimaryScore, PrimaryRisk, lots);
+      return StringFormat("PRIMARY TRADE: %s | Score %d/42 (need %d) | Risk %.1f%% | Lots: %.2f",
+                          dir, g_PrimaryScore, effPrim, PrimaryRisk, lots);
    }
 
    // Fallback strategy
-   if(g_FallbackScore >= MinFallbackScore) {
+   if(g_FallbackScore >= effFall) {
       string dir   = g_H1.bullish ? "BUY" : "SELL";
       double slPips = 10.0;
       double lots   = CalcLotSize(FallbackRisk, slPips);
       g_LastLotSize = lots;
-      return StringFormat("FALLBACK TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f",
-                          dir, g_FallbackScore, FallbackRisk, lots);
+      return StringFormat("FALLBACK TRADE: %s | Score %d/42 (need %d) | Risk %.1f%% | Lots: %.2f",
+                          dir, g_FallbackScore, effFall, FallbackRisk, lots);
    }
 
-   return StringFormat("NO TRADE — Primary: %d/42 | Fallback: %d/42 | Wait for confluence",
-                       g_PrimaryScore, g_FallbackScore);
+   return StringFormat("NO TRADE — Primary: %d/42 (need %d) | Fallback: %d/42 (need %d)",
+                       g_PrimaryScore, effPrim, g_FallbackScore, effFall);
 }
 
 //+------------------------------------------------------------------+
@@ -1998,7 +2346,7 @@ string TR(string label, string value) {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 110 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 130 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -2198,6 +2546,84 @@ void UpdateDashboard() {
                          PinBarWickRatio),
             ColorNeutral, FontSize);
    y += dy + 4;
+
+   // ── ADAPTIVE LEARNING ──
+   SetLabel(PREFIX+"ALH", x, y, "── ADAPTIVE LEARNING ──", ColorHeader, FontSize);
+   y += dy;
+
+   color learnClr = UseAdaptiveLearning ? ColorBull : ColorNeutral;
+   SetLabel(PREFIX+"AL1", x, y,
+            UseAdaptiveLearning ? g_LearnStatus : "Adaptive Learning: OFF",
+            learnClr, FontSize);
+   y += dy;
+
+   // Dynamic thresholds
+   int ep = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
+   int ef = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
+   color thr1c = (ep > MinPrimaryScore)  ? ColorBear : (ep < MinPrimaryScore)  ? ColorBull : ColorText;
+   color thr2c = (ef > MinFallbackScore) ? ColorBear : (ef < MinFallbackScore) ? ColorBull : ColorText;
+   SetLabel(PREFIX+"AL2", x, y,
+            StringFormat("Primary score threshold: %d  (base: %d)   Fallback: %d  (base: %d)   Batch: %d/%d",
+                         ep, MinPrimaryScore, ef, MinFallbackScore,
+                         g_BatchTradeCount, LearningBatchSize),
+            ColorText, FontSize);
+   y += dy;
+
+   // Session performance table
+   SetLabel(PREFIX+"AL3", x, y, "  Session Performance:", ColorHeader, FontSize);
+   y += dy;
+   for(int si = 0; si < SESSION_COUNT; si++) {
+      double swr = g_SessStats[si].total > 0 ?
+                   (double)g_SessStats[si].wins / g_SessStats[si].total * 100.0 : -1;
+      string swrStr = swr >= 0 ? StringFormat("%.1f%%", swr) : "No data";
+      string suspStr = g_SessStats[si].suspended ? " [SUSPENDED]" : "";
+      color  swrClr  = g_SessStats[si].suspended ? ColorBear :
+                       swr >= 60 ? ColorBull : swr >= 45 ? ColorWarn : ColorBear;
+      SetLabel(PREFIX+"ALS"+IntegerToString(si), x, y,
+               StringFormat("  %-14s  WR: %6s  (%d/%d trades)%s",
+                            g_SessionNames[si], swrStr,
+                            g_SessStats[si].wins, g_SessStats[si].total, suspStr),
+               swrClr, FontSize);
+      y += dy;
+   }
+
+   // Top 5 best confluences
+   SetLabel(PREFIX+"AL4", x, y, "  Confluence Win Rates (top performing):", ColorHeader, FontSize);
+   y += dy;
+
+   // Sort by confluence value descending — simple bubble pass for display
+   int   rankIdx[CONFLUENCE_COUNT];
+   for(int i = 0; i < CONFLUENCE_COUNT; i++) rankIdx[i] = i;
+   for(int i = 0; i < CONFLUENCE_COUNT - 1; i++)
+      for(int j = i + 1; j < CONFLUENCE_COUNT; j++)
+         if(ConfluenceValue(rankIdx[i]) < ConfluenceValue(rankIdx[j])) {
+            int tmp = rankIdx[i]; rankIdx[i] = rankIdx[j]; rankIdx[j] = tmp;
+         }
+
+   // Show top 5
+   int shown2 = 0;
+   for(int i = 0; i < CONFLUENCE_COUNT && shown2 < 5; i++) {
+      int   ci  = rankIdx[i];
+      double wr = ConfluenceWinRate(ci);
+      if(wr < 0) continue; // Not enough data
+      double cv = ConfluenceValue(ci);
+      color  wrc = wr >= 65 ? ColorBull : wr >= 50 ? ColorWarn : ColorBear;
+      SetLabel(PREFIX+"ALC"+IntegerToString(shown2), x, y,
+               StringFormat("  %-16s  WR: %.1f%%  Value: %+.1f  (%d trades)",
+                            g_ConfluenceNames[ci], wr, cv,
+                            g_ConfStats[ci].presentTotal),
+               wrc, FontSize);
+      y += dy;
+      shown2++;
+   }
+   if(shown2 == 0) {
+      SetLabel(PREFIX+"ALC0", x, y,
+               StringFormat("  Accumulating data... need %d trades per confluence",
+                            MinTradesForAdjust),
+               ColorNeutral, FontSize);
+      y += dy;
+   }
+   y += 4;
 
    // ── RECOMMENDATION ──
    SetLabel(PREFIX+"RH", x, y, "── TRADE RECOMMENDATION ──", ColorHeader, FontSize);
@@ -2559,7 +2985,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v10.0 | %s | Magic: %d | %s",
+            StringFormat("v11.0 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
