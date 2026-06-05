@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "9.00"
-#property description "XAUUSD Sniper EA — DXY Correlation + Candle Confirmation v9.0"
+#property version     "10.00"
+#property description "XAUUSD Sniper EA — MT5 Live News Calendar v10.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -66,10 +66,15 @@ input group            "=== SPREAD & SLIPPAGE FILTER ==="
 input double           MaxSpreadPips     = 30.0;   // Max allowed spread in pips
 input int              MaxSlippagePips   = 3;       // Max slippage in pips
 
-input group            "=== NEWS FILTER ==="
-input bool             UseNewsFilter     = true;   // Block trades near news
-input int              NewsMinutesBefore = 30;     // Minutes before news to block
-input int              NewsMinutesAfter  = 30;     // Minutes after news to block
+input group            "=== HIGH IMPACT NEWS FILTER ==="
+input bool             UseNewsFilter     = true;   // Block trades near high impact news
+input bool             BlockHighOnly     = true;   // true=High only | false=High+Medium
+input int              NewsMinutesBefore = 30;     // Minutes before news to block entry
+input int              NewsMinutesAfter  = 30;     // Minutes after news to resume
+input bool             BlockUSD          = true;   // Block on USD high impact news
+input bool             BlockXAU          = true;   // Block on Gold-specific news
+input bool             BlockEUR          = false;  // Block on EUR news (affects DXY)
+input bool             CloseOnHighImpact = false;  // Close open trades before high impact news
 
 input group            "=== ACCOUNT FLOOR ==="
 input bool             UseBalanceFloor   = true;   // Stop trading below minimum balance
@@ -209,15 +214,22 @@ bool       g_DailyLossHit      = false;  // Daily loss limit hit
 bool       g_MaxTradesHit      = false;  // Max daily trades hit
 bool       g_ConsecLossHit     = false;  // Max consecutive losses hit
 
-//--- News event times (UTC) — major events affecting XAUUSD
-//    Format: hour * 100 + minute (e.g. 1330 = 13:30 UTC)
-//    These are fixed weekly/monthly schedule times
-int g_NewsEvents[] = {
-   1330,   // US CPI / NFP / GDP (13:30 UTC = 21:30 PHT)
-   1800,   // Fed Rate Decision (18:00 UTC = 02:00 PHT next day)
-   1400,   // FOMC Minutes (14:00 UTC = 22:00 PHT)
-   1500    // US Retail Sales (15:00 UTC = 23:00 PHT)
+//--- MT5 Calendar — high impact news state
+struct NewsEvent {
+   string   name;       // Event name
+   datetime time;       // Scheduled UTC time
+   string   country;    // Country code (US, EU, etc.)
+   int      importance; // 3=High, 2=Medium, 1=Low
 };
+
+NewsEvent  g_NewsEvents[];          // Upcoming high impact events
+datetime   g_NextHighImpactTime = 0;// Next high impact event time
+string     g_NextHighImpactName = "";// Next event name
+string     g_NextHighImpactCountry="";
+int        g_NextNewsMinutesAway = 9999;
+bool       g_NewsBlocked        = false;
+string     g_NewsStatus         = "Checking...";
+datetime   g_LastCalendarUpdate = 0; // Throttle calendar queries
 
 //--- DXY state
 bool       g_DXY_Available     = false;  // True if DXY symbol found on broker
@@ -402,24 +414,125 @@ bool IsSpreadOK() {
 }
 
 //+------------------------------------------------------------------+
-//| Check if near a scheduled news event                           |
+//| Update high impact news from MT5 built-in economic calendar    |
+//| Queries next 24 hours for USD, XAU, EUR high impact events     |
+//+------------------------------------------------------------------+
+void UpdateNewsCalendar() {
+   if(!UseNewsFilter) {
+      g_NewsStatus  = "Filter OFF";
+      g_NewsBlocked = false;
+      return;
+   }
+
+   // Throttle — only query calendar every 5 minutes to save CPU
+   if(TimeCurrent() - g_LastCalendarUpdate < 300) return;
+   g_LastCalendarUpdate = TimeCurrent();
+
+   ArrayResize(g_NewsEvents, 0);
+
+   datetime fromTime = TimeCurrent() - NewsMinutesAfter  * 60;
+   datetime toTime   = TimeCurrent() + NewsMinutesBefore * 60 + 86400; // next 24h
+
+   MqlCalendarValue values[];
+   int count = CalendarValueHistory(values, fromTime, toTime);
+   if(count <= 0) {
+      g_NewsStatus = "Calendar: No data (check internet connection)";
+      return;
+   }
+
+   // Build filtered list of relevant high impact events
+   for(int i = 0; i < count; i++) {
+      MqlCalendarEvent event;
+      if(!CalendarEventById(values[i].event_id, event)) continue;
+
+      // Check importance level
+      bool isHigh   = (event.importance == CALENDAR_IMPORTANCE_HIGH);
+      bool isMedium = (event.importance == CALENDAR_IMPORTANCE_MODERATE);
+      if(BlockHighOnly && !isHigh)            continue;
+      if(!BlockHighOnly && !isHigh && !isMedium) continue;
+
+      // Check country filter
+      MqlCalendarCountry country;
+      if(!CalendarCountryById(event.country_id, country)) continue;
+
+      bool isUSD = (country.currency == "USD");
+      bool isXAU = (country.currency == "XAU");
+      bool isEUR = (country.currency == "EUR");
+
+      if(isUSD && !BlockUSD) continue;
+      if(isXAU && !BlockXAU) continue;
+      if(isEUR && !BlockEUR) continue;
+      if(!isUSD && !isXAU && !isEUR) continue;
+
+      // Add to list
+      int idx = ArraySize(g_NewsEvents);
+      ArrayResize(g_NewsEvents, idx + 1);
+      g_NewsEvents[idx].name       = event.name;
+      g_NewsEvents[idx].time       = values[i].time;
+      g_NewsEvents[idx].country    = country.currency;
+      g_NewsEvents[idx].importance = (int)event.importance;
+   }
+
+   // Find soonest upcoming event
+   g_NextHighImpactTime    = 0;
+   g_NextHighImpactName    = "";
+   g_NextHighImpactCountry = "";
+   g_NextNewsMinutesAway   = 9999;
+
+   datetime now = TimeCurrent();
+   for(int i = 0; i < ArraySize(g_NewsEvents); i++) {
+      int minutesAway = (int)((g_NewsEvents[i].time - now) / 60);
+      if(minutesAway < g_NextNewsMinutesAway && minutesAway > -NewsMinutesAfter) {
+         g_NextNewsMinutesAway   = minutesAway;
+         g_NextHighImpactTime    = g_NewsEvents[i].time;
+         g_NextHighImpactName    = g_NewsEvents[i].name;
+         g_NextHighImpactCountry = g_NewsEvents[i].country;
+      }
+   }
+
+   // Determine if currently blocked
+   g_NewsBlocked = false;
+   if(g_NextHighImpactTime > 0) {
+      int minsAway = g_NextNewsMinutesAway;
+      if(minsAway <= NewsMinutesBefore && minsAway >= -NewsMinutesAfter) {
+         g_NewsBlocked = true;
+      }
+   }
+
+   // Build status string
+   if(ArraySize(g_NewsEvents) == 0) {
+      g_NewsStatus = "No high impact news in next 24h — Clear to trade";
+   } else if(g_NewsBlocked) {
+      string when = g_NextNewsMinutesAway >= 0 ?
+                    StringFormat("in %d min", g_NextNewsMinutesAway) : "NOW — just released";
+      g_NewsStatus = StringFormat("BLOCKED: %s (%s) %s",
+                                  g_NextHighImpactName,
+                                  g_NextHighImpactCountry, when);
+   } else {
+      // Convert event time to PHT for display
+      MqlDateTime evtDt;
+      TimeToStruct(g_NextHighImpactTime, evtDt);
+      int phtH = (evtDt.hour + 8) % 24;
+      g_NewsStatus = StringFormat("Next: %s (%s) at %02d:%02d PHT — %d min away",
+                                  g_NextHighImpactName,
+                                  g_NextHighImpactCountry,
+                                  phtH, evtDt.min,
+                                  g_NextNewsMinutesAway);
+   }
+
+   // Close open trades if configured and news is imminent
+   if(CloseOnHighImpact && g_NewsBlocked && g_NextNewsMinutesAway >= 0 &&
+      g_NextNewsMinutesAway <= 5)
+      CloseAllTrades("High impact news in " +
+                     IntegerToString(g_NextNewsMinutesAway) + " min");
+}
+
+//+------------------------------------------------------------------+
+//| Check if near a high impact news event — uses calendar data     |
 //+------------------------------------------------------------------+
 bool IsNearNews() {
    if(!UseNewsFilter) return false;
-   MqlDateTime dt;
-   TimeToStruct(TimeGMT(), dt);
-   int nowHHMM = dt.hour * 100 + dt.min;
-
-   for(int i = 0; i < ArraySize(g_NewsEvents); i++) {
-      int newsHHMM  = g_NewsEvents[i];
-      int newsTotal = (newsHHMM / 100) * 60 + (newsHHMM % 100);
-      int nowTotal  = dt.hour * 60 + dt.min;
-      int diff      = nowTotal - newsTotal;
-
-      if(diff >= -NewsMinutesBefore && diff <= NewsMinutesAfter)
-         return true;
-   }
-   return false;
+   return g_NewsBlocked;
 }
 
 //+------------------------------------------------------------------+
@@ -1139,6 +1252,7 @@ void AnalyzeAllTimeframes() {
    g_M5  = AnalyzeSMC(_Symbol, TF_M5,  "M5",  BOS_Lookback);
 
    UpdateDXY();
+   UpdateNewsCalendar();
 
    g_PrimaryScore   = ScorePrimaryAdvanced(g_H4, g_H1, g_M15);
    g_FallbackScore  = ScoreFallbackAdvanced(g_H1, g_M15, g_M5);
@@ -1884,7 +1998,7 @@ string TR(string label, string value) {
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 96 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 110 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -2148,6 +2262,63 @@ void UpdateDashboard() {
    SetLabel(PREFIX+"DS4d", x + 310, y, balOK,     balClr,    FontSize);
    y += dy;
 
+   // ── HIGH IMPACT NEWS CALENDAR ──
+   y += 4;
+   SetLabel(PREFIX+"NWH", x, y, "── HIGH IMPACT NEWS CALENDAR ──", ColorHeader, FontSize);
+   y += dy;
+
+   // News status line
+   color nwClr = !UseNewsFilter    ? ColorNeutral :
+                 g_NewsBlocked     ? ColorBear    :
+                 ArraySize(g_NewsEvents) == 0 ? ColorBull : ColorWarn;
+   SetLabel(PREFIX+"NW1", x, y, g_NewsStatus, nwClr, FontSize);
+   y += dy;
+
+   // Show upcoming events list (up to 4)
+   int shown = 0;
+   datetime now = TimeCurrent();
+   for(int n = 0; n < ArraySize(g_NewsEvents) && shown < 4; n++) {
+      int minsAway = (int)((g_NewsEvents[n].time - now) / 60);
+      if(minsAway < -NewsMinutesAfter) continue; // already passed
+
+      MqlDateTime evtDt;
+      TimeToStruct(g_NewsEvents[n].time, evtDt);
+      int phtH = (evtDt.hour + 8) % 24;
+
+      string impact = g_NewsEvents[n].importance == 3 ? "HIGH  " : "MED   ";
+      string when   = minsAway >= 0 ?
+                      StringFormat("in %3d min", minsAway) : "ACTIVE";
+      string evtLine = StringFormat("  [%s] %s  %s (%s)  @%02d:%02d PHT",
+                                    impact,
+                                    when,
+                                    g_NewsEvents[n].name,
+                                    g_NewsEvents[n].country,
+                                    phtH, evtDt.min);
+      color evtClr = (minsAway >= 0 && minsAway <= NewsMinutesBefore) ? ColorBear :
+                     (minsAway < 0) ? ColorWarn : ColorText;
+      SetLabel(PREFIX+"NWE"+IntegerToString(shown), x, y, evtLine, evtClr, FontSize);
+      y += dy;
+      shown++;
+   }
+   if(shown == 0 && UseNewsFilter) {
+      SetLabel(PREFIX+"NWE0", x, y, "  No upcoming high impact events in next 24h", ColorBull, FontSize);
+      y += dy;
+   }
+
+   // Settings summary
+   string impactLevel = BlockHighOnly ? "HIGH only" : "HIGH + MEDIUM";
+   string countries   = "";
+   if(BlockUSD) countries += "USD ";
+   if(BlockXAU) countries += "XAU ";
+   if(BlockEUR) countries += "EUR ";
+   SetLabel(PREFIX+"NW2", x, y,
+            StringFormat("Filter: %s  |  Countries: %s  |  Block: %dmin before / %dmin after  |  Close on news: %s",
+                         impactLevel, countries,
+                         NewsMinutesBefore, NewsMinutesAfter,
+                         CloseOnHighImpact ? "YES" : "NO"),
+            ColorNeutral, FontSize);
+   y += dy + 4;
+
    // Block reason if any
    if(g_BlockReason != "") {
       SetLabel(PREFIX+"DS5", x, y,
@@ -2388,7 +2559,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v9.0 | %s | Magic: %d | %s",
+            StringFormat("v10.0 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
