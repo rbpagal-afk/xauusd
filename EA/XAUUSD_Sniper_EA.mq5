@@ -6,12 +6,13 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "7.00"
-#property description "XAUUSD Sniper EA — Final Release with Backtest + Report + Optimization"
+#property version     "8.00"
+#property description "XAUUSD Sniper EA — Advanced SMC Engine v8.0"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
+#include "SMC_Engine.mqh"
 
 CTrade         Trade;
 CPositionInfo  PositionInfo;
@@ -160,26 +161,8 @@ ENUM_TIMEFRAMES TF_H1   = PERIOD_H1;
 ENUM_TIMEFRAMES TF_M15  = PERIOD_M15;
 ENUM_TIMEFRAMES TF_M5   = PERIOD_M5;
 
-//+------------------------------------------------------------------+
-//| Structure to hold analysis for one timeframe                     |
-//+------------------------------------------------------------------+
-struct TFAnalysis {
-   string   name;
-   bool     bullish;
-   bool     hasBOS;
-   bool     hasCHoCH;
-   bool     hasOB;
-   bool     hasFVG;
-   bool     hasLiqSweep;
-   bool     inDiscount;
-   bool     inPremium;
-   double   obHigh;
-   double   obLow;
-   string   narrative;
-};
-
-//--- Global state
-TFAnalysis g_H4, g_H1, g_M15, g_M5;
+//--- Global state — uses advanced SMC engine (SMCAnalysis from SMC_Engine.mqh)
+SMCAnalysis g_H4, g_H1, g_M15, g_M5;
 int        g_PrimaryScore   = 0;
 int        g_FallbackScore  = 0;
 string     g_Session        = "";
@@ -953,200 +936,22 @@ void OnChartEvent(const int id, const long &lparam,
 }
 
 //+------------------------------------------------------------------+
-//| Analyze all timeframes                                           |
+//| Analyze all timeframes using advanced SMC engine                |
 //+------------------------------------------------------------------+
 void AnalyzeAllTimeframes() {
-   g_H4  = AnalyzeTF(TF_H4,  "H4");
-   g_H1  = AnalyzeTF(TF_H1,  "H1");
-   g_M15 = AnalyzeTF(TF_M15, "M15");
-   g_M5  = AnalyzeTF(TF_M5,  "M5");
+   g_H4  = AnalyzeSMC(_Symbol, TF_H4,  "H4",  BOS_Lookback);
+   g_H1  = AnalyzeSMC(_Symbol, TF_H1,  "H1",  BOS_Lookback);
+   g_M15 = AnalyzeSMC(_Symbol, TF_M15, "M15", BOS_Lookback);
+   g_M5  = AnalyzeSMC(_Symbol, TF_M5,  "M5",  BOS_Lookback);
 
-   g_PrimaryScore  = ScorePrimary();
-   g_FallbackScore = ScoreFallback();
-   g_Session       = GetSession();
-   g_UseFallback   = (g_PrimaryScore < MinPrimaryScore);
+   g_PrimaryScore   = ScorePrimaryAdvanced(g_H4, g_H1, g_M15);
+   g_FallbackScore  = ScoreFallbackAdvanced(g_H1, g_M15, g_M5);
+   g_Session        = GetSession();
+   g_UseFallback    = (g_PrimaryScore < MinPrimaryScore);
    g_Recommendation = GetRecommendation();
 }
 
-//+------------------------------------------------------------------+
-//| Analyze a single timeframe                                       |
-//+------------------------------------------------------------------+
-TFAnalysis AnalyzeTF(ENUM_TIMEFRAMES tf, string name) {
-   TFAnalysis a;
-   a.name = name;
-
-   // Get candle data — safely handles any timeframe
-   int bars = iBars(_Symbol, tf);
-   if(bars < BOS_Lookback + 10) {
-      a.narrative = "Waiting for data...";
-      return a;
-   }
-
-   double high[], low[], close[], open[];
-   ArraySetAsSeries(high,  true);
-   ArraySetAsSeries(low,   true);
-   ArraySetAsSeries(close, true);
-   ArraySetAsSeries(open,  true);
-
-   if(CopyHigh (_Symbol, tf, 0, BOS_Lookback, high)  < BOS_Lookback ||
-      CopyLow  (_Symbol, tf, 0, BOS_Lookback, low)   < BOS_Lookback ||
-      CopyClose(_Symbol, tf, 0, BOS_Lookback, close) < BOS_Lookback ||
-      CopyOpen (_Symbol, tf, 0, BOS_Lookback, open)  < BOS_Lookback) {
-      a.narrative = "Loading data...";
-      return a;
-   }
-
-   // --- BOS Detection ---
-   double swingHigh = high[ArrayMaximum(high, 1, BOS_Lookback - 1)];
-   double swingLow  = low [ArrayMinimum(low,  1, BOS_Lookback - 1)];
-
-   a.hasBOS   = false;
-   a.bullish  = false;
-
-   // Bullish BOS: current close breaks above recent swing high
-   if(close[0] > swingHigh) {
-      a.hasBOS  = true;
-      a.bullish = true;
-   }
-   // Bearish BOS: current close breaks below recent swing low
-   else if(close[0] < swingLow) {
-      a.hasBOS  = true;
-      a.bullish = false;
-   }
-   else {
-      // No BOS — use trend of last few candles
-      a.bullish = (close[0] > close[MathMin(5, BOS_Lookback-1)]);
-   }
-
-   // --- Premium / Discount ---
-   double rangeHigh = high[ArrayMaximum(high, 0, BOS_Lookback)];
-   double rangeLow  = low [ArrayMinimum(low,  0, BOS_Lookback)];
-   double rangeMid  = (rangeHigh + rangeLow) / 2.0;
-   a.inDiscount = (close[0] < rangeMid);
-   a.inPremium  = (close[0] > rangeMid);
-
-   // --- Order Block Detection ---
-   a.hasOB   = false;
-   a.obHigh  = 0;
-   a.obLow   = 0;
-   int obLookback = MathMin(OB_Lookback, BOS_Lookback - 2);
-   for(int i = 1; i < obLookback; i++) {
-      bool bigMoveUp   = (close[i-1] - open[i-1]) > 2 * (close[i] - open[i]) && close[i-1] > open[i-1];
-      bool bigMoveDown = (open[i-1] - close[i-1]) > 2 * (open[i] - close[i]) && close[i-1] < open[i-1];
-      if(a.bullish && bigMoveUp && open[i] > close[i]) {
-         a.hasOB  = true;
-         a.obHigh = high[i];
-         a.obLow  = low[i];
-         break;
-      }
-      if(!a.bullish && bigMoveDown && open[i] < close[i]) {
-         a.hasOB  = true;
-         a.obHigh = high[i];
-         a.obLow  = low[i];
-         break;
-      }
-   }
-
-   // --- FVG Detection ---
-   a.hasFVG = false;
-   int fvgLookback = MathMin(FVG_Lookback + 2, BOS_Lookback - 2);
-   for(int i = 1; i < fvgLookback; i++) {
-      // Bullish FVG: gap between candle[i+1] high and candle[i-1] low
-      if(a.bullish && low[i-1] > high[i+1]) {
-         a.hasFVG = true;
-         break;
-      }
-      // Bearish FVG: gap between candle[i+1] low and candle[i-1] high
-      if(!a.bullish && high[i-1] < low[i+1]) {
-         a.hasFVG = true;
-         break;
-      }
-   }
-
-   // --- CHoCH Detection ---
-   a.hasCHoCH = false;
-   // Look for a swing that breaks in the opposite direction then recovers
-   if(BOS_Lookback >= 6) {
-      double recentHigh = high[ArrayMaximum(high, 1, 5)];
-      double recentLow  = low [ArrayMinimum(low,  1, 5)];
-      double prevHigh   = high[ArrayMaximum(high, 6, MathMin(15, BOS_Lookback-6))];
-      double prevLow    = low [ArrayMinimum(low,  6, MathMin(15, BOS_Lookback-6))];
-
-      // Bullish CHoCH: was making lower highs, now breaks above previous high
-      if(a.bullish && recentHigh > prevHigh && close[0] > recentHigh)
-         a.hasCHoCH = true;
-      // Bearish CHoCH: was making higher lows, now breaks below previous low
-      if(!a.bullish && recentLow < prevLow && close[0] < recentLow)
-         a.hasCHoCH = true;
-   }
-
-   // --- Liquidity Sweep Detection ---
-   a.hasLiqSweep = false;
-   int sweepLookback = MathMin(Sweep_Lookback + 1, BOS_Lookback - 1);
-   for(int i = 1; i < sweepLookback; i++) {
-      double prevSwingLow  = low [ArrayMinimum(low,  i+1, MathMin(10, BOS_Lookback-i-1))];
-      double prevSwingHigh = high[ArrayMaximum(high, i+1, MathMin(10, BOS_Lookback-i-1))];
-      // Bullish sweep: wick went below swing low but closed back above
-      if(a.bullish && low[i] < prevSwingLow && close[i] > prevSwingLow) {
-         a.hasLiqSweep = true;
-         break;
-      }
-      // Bearish sweep: wick went above swing high but closed back below
-      if(!a.bullish && high[i] > prevSwingHigh && close[i] < prevSwingHigh) {
-         a.hasLiqSweep = true;
-         break;
-      }
-   }
-
-   // --- Build Narrative ---
-   string dir    = a.bullish ? "BULLISH" : "BEARISH";
-   string zone   = a.inDiscount ? "Discount" : (a.inPremium ? "Premium" : "Mid-Range");
-   string bos    = a.hasBOS      ? "BOS ✓"       : "No BOS";
-   string choch  = a.hasCHoCH    ? "CHoCH ✓"     : "No CHoCH";
-   string ob     = a.hasOB       ? "OB ✓"        : "No OB";
-   string fvg    = a.hasFVG      ? "FVG ✓"       : "No FVG";
-   string sweep  = a.hasLiqSweep ? "Sweep ✓"     : "No Sweep";
-
-   a.narrative = StringFormat("%s | %s | %s | %s | %s | %s | %s",
-                              dir, zone, bos, choch, ob, fvg, sweep);
-   return a;
-}
-
-//+------------------------------------------------------------------+
-//| Score primary strategy H4/H1/M15                                |
-//+------------------------------------------------------------------+
-int ScorePrimary() {
-   int score = 0;
-   if(g_H4.hasBOS && g_H4.bullish == g_H1.bullish)  score += 2; // H4 BOS aligned
-   if((g_H4.bullish && g_H4.inDiscount) ||
-      (!g_H4.bullish && g_H4.inPremium))              score += 1; // Correct zone
-   if(g_H4.hasOB)                                     score += 2; // H4 OB
-   if(g_H1.hasCHoCH && g_H1.bullish == g_H4.bullish) score += 2; // H1 CHoCH
-   if(g_H1.hasFVG && g_H1.hasOB)                     score += 1; // H1 FVG+OB
-   if(g_M15.hasLiqSweep)                              score += 2; // M15 Sweep
-   if(g_M15.hasCHoCH)                                 score += 1; // M15 CHoCH
-   if(g_M15.hasFVG)                                   score += 1; // M15 FVG
-   if(g_M15.hasOB)                                    score += 1; // M15 confirmation
-   return score;
-}
-
-//+------------------------------------------------------------------+
-//| Score fallback strategy H1/M15/M5                               |
-//+------------------------------------------------------------------+
-int ScoreFallback() {
-   int score = 0;
-   if(g_H1.hasBOS && g_H1.bullish == g_M15.bullish)  score += 2;
-   if((g_H1.bullish && g_H1.inDiscount) ||
-      (!g_H1.bullish && g_H1.inPremium))              score += 1;
-   if(g_H1.hasOB)                                     score += 2;
-   if(g_M15.hasCHoCH && g_M15.bullish == g_H1.bullish) score += 2;
-   if(g_M15.hasFVG && g_M15.hasOB)                   score += 1;
-   if(g_M5.hasLiqSweep)                               score += 2;
-   if(g_M5.hasCHoCH)                                  score += 1;
-   if(g_M5.hasFVG)                                    score += 1;
-   if(g_M5.hasOB)                                     score += 1;
-   return score;
-}
+// NOTE: AnalyzeTF, ScorePrimary, ScoreFallback replaced by SMC_Engine.mqh
 
 //+------------------------------------------------------------------+
 //| Get current session in PHT (UTC+8)                              |
@@ -1188,7 +993,7 @@ string GetRecommendation() {
       double slPips = 15.0; // Estimated — replaced by actual SL on entry
       double lots   = CalcLotSize(PrimaryRisk, slPips);
       g_LastLotSize = lots;
-      return StringFormat("PRIMARY TRADE: %s | Score %d/13 | Risk %.1f%% | Lots: %.2f",
+      return StringFormat("PRIMARY TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f",
                           dir, g_PrimaryScore, PrimaryRisk, lots);
    }
 
@@ -1198,11 +1003,11 @@ string GetRecommendation() {
       double slPips = 10.0;
       double lots   = CalcLotSize(FallbackRisk, slPips);
       g_LastLotSize = lots;
-      return StringFormat("FALLBACK TRADE: %s | Score %d/13 | Risk %.1f%% | Lots: %.2f",
+      return StringFormat("FALLBACK TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f",
                           dir, g_FallbackScore, FallbackRisk, lots);
    }
 
-   return StringFormat("NO TRADE — Primary: %d/13 | Fallback: %d/13 | Wait for confluence",
+   return StringFormat("NO TRADE — Primary: %d/42 | Fallback: %d/42 | Wait for confluence",
                        g_PrimaryScore, g_FallbackScore);
 }
 
@@ -1528,17 +1333,21 @@ void DrawChartVisuals() {
 
 void DrawOrderBlocks() {
    // Draw H4 OB
-   if(g_H4.hasOB && g_H4.obHigh > 0)
+   if(g_H4.hasFreshOB && g_H4.obHigh > 0)
       DrawBox("VIS_OB_H4", TF_H4, g_H4.obHigh, g_H4.obLow,
-              g_H4.bullish ? ColorOB_Bull : ColorOB_Bear, "H4 OB");
+              g_H4.bullish ? ColorOB_Bull : ColorOB_Bear, "H4 FreshOB");
    // Draw H1 OB
-   if(g_H1.hasOB && g_H1.obHigh > 0)
+   if(g_H1.hasFreshOB && g_H1.obHigh > 0)
       DrawBox("VIS_OB_H1", TF_H1, g_H1.obHigh, g_H1.obLow,
-              g_H1.bullish ? ColorOB_Bull : ColorOB_Bear, "H1 OB");
+              g_H1.bullish ? ColorOB_Bull : ColorOB_Bear, "H1 FreshOB");
    // Draw M15 OB
-   if(g_M15.hasOB && g_M15.obHigh > 0)
+   if(g_M15.hasFreshOB && g_M15.obHigh > 0)
       DrawBox("VIS_OB_M15", TF_M15, g_M15.obHigh, g_M15.obLow,
-              g_M15.bullish ? ColorOB_Bull : ColorOB_Bear, "M15 OB");
+              g_M15.bullish ? ColorOB_Bull : ColorOB_Bear, "M15 FreshOB");
+   // Draw H4 Breaker Block if present
+   if(g_H4.hasBreakerBlock && g_H4.breakerHigh > 0)
+      DrawBox("VIS_BB_H4", TF_H4, g_H4.breakerHigh, g_H4.breakerLow,
+              g_H4.bullish ? ColorOB_Bear : ColorOB_Bull, "H4 Breaker");
 }
 
 void DrawBox(string name, ENUM_TIMEFRAMES tf, double hi, double lo,
@@ -1565,8 +1374,8 @@ void DrawFVGZones() {
 }
 
 void DrawFVGForTF(ENUM_TIMEFRAMES tf, string name,
-                  TFAnalysis &a, string label) {
-   if(!a.hasFVG) return;
+                  SMCAnalysis &a, string label) {
+   if(!a.hasFVGOpen) return;
 
    double high[], low[];
    ArraySetAsSeries(high, true);
@@ -1608,7 +1417,7 @@ void DrawSweepLines() {
 }
 
 void DrawSweepForTF(ENUM_TIMEFRAMES tf, string name,
-                    TFAnalysis &a, string label) {
+                    SMCAnalysis &a, string label) {
    if(!a.hasLiqSweep) return;
    double arr[];
    ArraySetAsSeries(arr, true);
@@ -1638,7 +1447,7 @@ void DrawSweepForTF(ENUM_TIMEFRAMES tf, string name,
 
 void DrawStructureArrows() {
    // BOS arrows on H4
-   if(ShowBOSArrows && g_H4.hasBOS) {
+   if(ShowBOSArrows && g_H4.hasExternalBOS) {
       string name = "VIS_BOS_H4";
       if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
       ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_H4, 1),
@@ -1718,7 +1527,7 @@ void SendSignalNotification(string strategy, bool isBuy, int score,
                             double tp2, double lots, double riskPct) {
    string dir  = isBuy ? "BUY" : "SELL";
    string msg  = StringFormat(
-      "XAUUSD SNIPER | %s %s\nScore: %d/13 | %s\nEntry: %.2f\nSL: %.2f | TP1: %.2f | TP2: %.2f\nRisk: %.1f%% | Lots: %.2f",
+      "XAUUSD SNIPER | %s %s\nScore: %d/42 | %s\nEntry: %.2f\nSL: %.2f | TP1: %.2f | TP2: %.2f\nRisk: %.1f%% | Lots: %.2f",
       strategy, dir, score, g_Session,
       entry, sl, tp1, tp2, riskPct, lots);
 
@@ -1856,7 +1665,7 @@ void GenerateHTMLReport() {
    html += TR("Max Spread Pips",      StringFormat("%.1f",   MaxSpreadPips));
    html += "</table>";
 
-   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v7.0 — Philippines Sniper Strategy</p>";
+   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v8.0 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
    html += "</body></html>";
 
    FileWriteString(fh, html);
@@ -1914,99 +1723,126 @@ void UpdateDashboard() {
             StringFormat("Session: %s", g_Session), sessionColor, FontSize);
    y += dy + 4;
 
-   // ── PRIMARY STRATEGY ──
-   SetLabel(PREFIX+"PH", x, y, "── PRIMARY STRATEGY: H4 → H1 → M15 ──",
-            ColorHeader, FontSize);
+   // ── PRIMARY STRATEGY H4 / H1 / M15 ──
+   SetLabel(PREFIX+"PH", x, y, "── PRIMARY STRATEGY: H4 → H1 → M15 ──", ColorHeader, FontSize);
    y += dy;
 
-   // H4
-   color h4c = g_H4.bullish ? ColorBull : ColorBear;
-   SetLabel(PREFIX+"H4L", x, y, "H4  │", ColorHeader, FontSize);
-   SetLabel(PREFIX+"H4V", x + 45, y, g_H4.narrative, h4c, FontSize);
+   color h4c  = g_H4.bullish  ? ColorBull : ColorBear;
+   color h1c  = g_H1.bullish  ? ColorBull : ColorBear;
+   color m15c = g_M15.bullish ? ColorBull : ColorBear;
+   color m5c  = g_M5.bullish  ? ColorBull : ColorBear;
+
+   // H4 Structure
+   SetLabel(PREFIX+"H4L",  x, y, "H4  STRUCT│", ColorHeader, FontSize);
+   SetLabel(PREFIX+"H4V",  x+95, y, g_H4.structureNarrative, h4c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"H4L2", x, y, "H4  LIQ   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"H4V2", x+95, y, g_H4.liquidityNarrative, h4c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"H4L3", x, y, "H4  S/R   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"H4V3", x+95, y, g_H4.srNarrative, ColorNeutral, FontSize);
    y += dy;
 
    // H1
-   color h1c = g_H1.bullish ? ColorBull : ColorBear;
-   SetLabel(PREFIX+"H1L", x, y, "H1  │", ColorHeader, FontSize);
-   SetLabel(PREFIX+"H1V", x + 45, y, g_H1.narrative, h1c, FontSize);
+   SetLabel(PREFIX+"H1L",  x, y, "H1  STRUCT│", ColorHeader, FontSize);
+   SetLabel(PREFIX+"H1V",  x+95, y, g_H1.structureNarrative, h1c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"H1L2", x, y, "H1  LIQ   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"H1V2", x+95, y, g_H1.liquidityNarrative, h1c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"H1L3", x, y, "H1  S/R   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"H1V3", x+95, y, g_H1.srNarrative, ColorNeutral, FontSize);
    y += dy;
 
    // M15
-   color m15c = g_M15.bullish ? ColorBull : ColorBear;
-   SetLabel(PREFIX+"M15L", x, y, "M15 │", ColorHeader, FontSize);
-   SetLabel(PREFIX+"M15V", x + 45, y, g_M15.narrative, m15c, FontSize);
+   SetLabel(PREFIX+"M15A", x, y, "M15 STRUCT│", ColorHeader, FontSize);
+   SetLabel(PREFIX+"M15B", x+95, y, g_M15.structureNarrative, m15c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"M15C", x, y, "M15 LIQ   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"M15D", x+95, y, g_M15.liquidityNarrative, m15c, FontSize);
    y += dy;
 
-   // Primary Score
    color psColor = (g_PrimaryScore >= MinPrimaryScore) ? ColorBull :
-                   (g_PrimaryScore >= 5) ? ColorWarn : ColorBear;
+                   (g_PrimaryScore >= 15) ? ColorWarn : ColorBear;
    SetLabel(PREFIX+"PS", x, y,
-            StringFormat("Primary Score: %d / 13   (Need %d to trade)",
-                         g_PrimaryScore, MinPrimaryScore),
-            psColor, FontSize);
+            StringFormat("Primary Score: %d / 42   (Need %d to trade)",
+                         g_PrimaryScore, MinPrimaryScore), psColor, FontSize);
    y += dy + 4;
 
-   // ── FALLBACK STRATEGY ──
-   SetLabel(PREFIX+"FH", x, y, "── FALLBACK STRATEGY: H1 → M15 → M5 ──",
-            ColorHeader, FontSize);
+   // ── FALLBACK STRATEGY H1 / M15 / M5 ──
+   SetLabel(PREFIX+"FH", x, y, "── FALLBACK STRATEGY: H1 → M15 → M5 ──", ColorHeader, FontSize);
    y += dy;
 
-   // H1 (reused)
-   SetLabel(PREFIX+"FH1L", x, y, "H1  │", ColorHeader, FontSize);
-   SetLabel(PREFIX+"FH1V", x + 45, y, g_H1.narrative, h1c, FontSize);
+   SetLabel(PREFIX+"FM5A", x, y, "M5  STRUCT│", ColorHeader, FontSize);
+   SetLabel(PREFIX+"FM5B", x+95, y, g_M5.structureNarrative, m5c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"FM5C", x, y, "M5  LIQ   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"FM5D", x+95, y, g_M5.liquidityNarrative, m5c, FontSize);
    y += dy;
 
-   // M15 (reused)
-   SetLabel(PREFIX+"FM15L", x, y, "M15 │", ColorHeader, FontSize);
-   SetLabel(PREFIX+"FM15V", x + 45, y, g_M15.narrative, m15c, FontSize);
-   y += dy;
-
-   // M5
-   color m5c = g_M5.bullish ? ColorBull : ColorBear;
-   SetLabel(PREFIX+"M5L", x, y, "M5  │", ColorHeader, FontSize);
-   SetLabel(PREFIX+"M5V", x + 45, y, g_M5.narrative, m5c, FontSize);
-   y += dy;
-
-   // Fallback Score
    color fsColor = (g_FallbackScore >= MinFallbackScore) ? ColorBull :
-                   (g_FallbackScore >= 6) ? ColorWarn : ColorBear;
+                   (g_FallbackScore >= 15) ? ColorWarn : ColorBear;
    SetLabel(PREFIX+"FS", x, y,
-            StringFormat("Fallback Score: %d / 13  (Need %d to trade)",
-                         g_FallbackScore, MinFallbackScore),
-            fsColor, FontSize);
+            StringFormat("Fallback Score: %d / 42  (Need %d to trade)",
+                         g_FallbackScore, MinFallbackScore), fsColor, FontSize);
    y += dy + 4;
 
-   // ── CONFLUENCE CHECKLIST ──
-   SetLabel(PREFIX+"CH", x, y, "── CONFLUENCE CHECKLIST ──", ColorHeader, FontSize);
+   // ── ADVANCED SMC CHECKLIST ──
+   SetLabel(PREFIX+"CH", x, y, "── ADVANCED SMC CHECKLIST ──", ColorHeader, FontSize);
    y += dy;
 
-   // Primary checklist
+   // Structure row
    SetLabel(PREFIX+"C1", x, y,
-            CheckMark(g_H4.hasBOS)       + " H4 BOS   " +
-            CheckMark(g_H4.hasOB)        + " H4 OB    " +
-            CheckMark(g_H4.inDiscount || g_H4.inPremium) + " H4 Zone",
+            CheckMark(g_H4.hasExternalBOS) + " H4 ExtBOS  " +
+            CheckMark(g_H4.hasMSS)         + " H4 MSS     " +
+            CheckMark(g_H4.hasFreshOB)     + " H4 FreshOB",
             ColorText, FontSize);
    y += dy;
 
    SetLabel(PREFIX+"C2", x, y,
-            CheckMark(g_H1.hasCHoCH)     + " H1 CHoCH " +
-            CheckMark(g_H1.hasOB)        + " H1 OB    " +
-            CheckMark(g_H1.hasFVG)       + " H1 FVG",
+            CheckMark(g_H1.hasCHoCH)       + " H1 CHoCH   " +
+            CheckMark(g_H1.hasMSS)         + " H1 MSS     " +
+            CheckMark(g_H1.hasFVGOpen)     + " H1 OpenFVG",
             ColorText, FontSize);
    y += dy;
 
    SetLabel(PREFIX+"C3", x, y,
-            CheckMark(g_M15.hasLiqSweep) + " M15 Sweep" +
-            CheckMark(g_M15.hasCHoCH)    + " M15 CHoCH" +
-            CheckMark(g_M15.hasFVG)      + " M15 FVG",
+            CheckMark(g_M15.hasLiqSweep)   + " M15 Sweep  " +
+            CheckMark(g_M15.hasFreshOB)    + " M15 FreshOB" +
+            CheckMark(g_M15.hasFVGOpen)    + " M15 OpenFVG",
             ColorText, FontSize);
    y += dy;
 
    SetLabel(PREFIX+"C4", x, y,
-            CheckMark(g_M5.hasLiqSweep)  + " M5 Sweep " +
-            CheckMark(g_M5.hasCHoCH)     + " M5 CHoCH " +
-            CheckMark(g_M5.hasFVG)       + " M5 FVG",
+            CheckMark(g_H4.hasEqualHighs || g_H4.hasEqualLows) + " EqH/L " +
+            CheckMark(g_H1.inOTE)          + " H1 OTE     " +
+            CheckMark(g_M15.isJudasSwing)  + " Judas Swing",
             ColorText, FontSize);
+   y += dy;
+
+   SetLabel(PREFIX+"C5", x, y,
+            CheckMark(g_H4.atKeySR)        + " H4 At S/R  " +
+            CheckMark(g_H1.hasDisplacement)+ " H1 Displace" +
+            CheckMark(g_M15.hasBreakerBlock)+" M15 Breaker",
+            ColorText, FontSize);
+   y += dy;
+
+   // Asian range
+   string asianStr = StringFormat("Asia Range: %.2f — %.2f  |  Price: %s",
+                                  g_H1.asianLow, g_H1.asianHigh,
+                                  g_H1.aboveAsianHigh ? "ABOVE (broke out)" :
+                                  g_H1.belowAsianLow  ? "BELOW (broke out)" : "Inside range");
+   color asianClr  = (g_H1.aboveAsianHigh || g_H1.belowAsianLow) ? ColorBull : ColorWarn;
+   SetLabel(PREFIX+"C6", x, y, asianStr, asianClr, FontSize);
+   y += dy;
+
+   // Silver Bullet window
+   color sbClr = g_M15.inSilverBullet ? ColorBull : ColorNeutral;
+   SetLabel(PREFIX+"C7", x, y,
+            StringFormat("Silver Bullet Window: %s  |  Weekly H/L: %.2f / %.2f",
+                         g_M15.inSilverBullet ? "ACTIVE (22:00-23:00 PHT)" : "Not active",
+                         g_H4.weeklyHigh, g_H4.weeklyLow),
+            sbClr, FontSize);
    y += dy + 4;
 
    // ── RECOMMENDATION ──
@@ -2312,7 +2148,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v7.0 FINAL | %s | Magic: %d | %s",
+            StringFormat("v8.0 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
