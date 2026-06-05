@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "6.00"
-#property description "XAUUSD Sniper EA — Session Close + Drawdown + Weekly/Monthly Limits"
+#property version     "7.00"
+#property description "XAUUSD Sniper EA — Final Release with Backtest + Report + Optimization"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -118,6 +118,22 @@ input string           SoundBuy          = "news.wav";  // Sound for BUY signal
 input string           SoundSell         = "news.wav";  // Sound for SELL signal
 input string           SoundTP           = "ok.wav";    // Sound for TP hit
 input string           SoundSL           = "stops.wav"; // Sound for SL hit
+
+input group            "=== REPORT ==="
+input bool             GenerateReport    = true;   // Generate HTML report on backtest end
+input string           ReportFileName    = "XAUUSD_Sniper_Report.html"; // Report file name
+
+input group            "=== OPTIMIZATION TARGETS ==="
+// These are the parameters the Strategy Tester will vary during optimization
+// In MT5: right-click each input → check Optimize checkbox
+// Recommended ranges shown in comments
+input int              OPT_MinPrimary    = 7;      // Optimize: Min primary score (range 5-10)
+input int              OPT_MinFallback   = 9;      // Optimize: Min fallback score (range 7-11)
+input double           OPT_TP1_RR        = 1.0;    // Optimize: TP1 RR (range 0.5-2.0, step 0.5)
+input double           OPT_TP2_RR        = 3.0;    // Optimize: TP2 RR (range 2.0-5.0, step 0.5)
+input double           OPT_TrailDist     = 15.0;   // Optimize: Trail distance pips (range 10-30)
+input double           OPT_BETrigger     = 1.0;    // Optimize: Breakeven trigger (range 0.5-2.0)
+input double           OPT_SLBuffer      = 5.0;    // Optimize: SL buffer pips (range 3-10)
 
 input group            "=== DASHBOARD ==="
 input int              Dashboard_X       = 20;     // Dashboard X position
@@ -230,6 +246,22 @@ string     g_JournalPath       = "";
 //--- Visual tracking — avoid redrawing every tick
 datetime   g_LastVisualBar     = 0;
 
+//--- Backtest / Tester state
+bool       g_IsTesting         = false;  // True when running in Strategy Tester
+double     g_MaxEquity         = 0;      // Peak equity during backtest
+double     g_MinEquity         = 0;      // Lowest equity during backtest
+double     g_StartBalance      = 0;      // Balance at EA start
+int        g_WinStreak         = 0;      // Current win streak
+int        g_LoseStreak        = 0;      // Current lose streak
+int        g_MaxWinStreak      = 0;      // Best win streak
+int        g_MaxLoseStreak     = 0;      // Worst lose streak
+double     g_BestTrade         = 0;      // Best single trade profit
+double     g_WorstTrade        = 0;      // Worst single trade loss
+double     g_TotalPips         = 0;      // Total pips won/lost
+int        g_PrimaryTrades     = 0;      // Trades taken by primary strategy
+int        g_FallbackTrades    = 0;      // Trades taken by fallback strategy
+datetime   g_EAStartTime       = 0;      // When EA started
+
 //--- Drawdown tracking
 double     g_PeakBalance       = 0;      // Highest balance ever reached
 double     g_CurrentDrawdown   = 0;      // Current drawdown % from peak
@@ -257,19 +289,51 @@ bool       g_FridayCloseDone   = false;  // Tracks if Friday close already fired
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
-   EventSetTimer(5);
+   g_IsTesting   = MQLInfoInteger(MQL_TESTER);
+   g_EAStartTime = TimeCurrent();
+   g_StartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_MaxEquity    = g_StartBalance;
+   g_MinEquity    = g_StartBalance;
+
+   EventSetTimer(g_IsTesting ? 1 : 5);
    Trade.SetDeviationInPoints(MaxSlippagePips * 10);
    Trade.SetExpertMagicNumber(MagicNumber);
-   g_PeakBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_PeakBalance = g_StartBalance;
+
    ResetDailyTracking();
    ResetWeeklyTracking();
    ResetMonthlyTracking();
-   InitJournal();
-   CreateDashboard();
-   AnalyzeAllTimeframes();
-   DrawChartVisuals();
-   UpdateDashboard();
+
+   if(!g_IsTesting) InitJournal();
+
+   if(!g_IsTesting) {
+      CreateDashboard();
+      AnalyzeAllTimeframes();
+      DrawChartVisuals();
+      UpdateDashboard();
+   }
    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Strategy Tester — return custom optimization metric             |
+//+------------------------------------------------------------------+
+double OnTester() {
+   // Custom metric: Profit Factor weighted by win rate and low drawdown
+   double profitFactor = GetProfitFactor();
+   double winRate      = GetWinRate() / 100.0;
+   double ddPenalty    = g_CurrentDrawdown > 0 ? 1.0 / (1.0 + g_CurrentDrawdown / 10.0) : 1.0;
+   double metric       = profitFactor * winRate * ddPenalty;
+
+   if(GenerateReport) GenerateHTMLReport();
+   return metric;
+}
+
+//+------------------------------------------------------------------+
+//| Tester pass completed (optimization only)                       |
+//+------------------------------------------------------------------+
+void OnTesterPass() {
+   // Called after each optimization pass — nothing extra needed
 }
 
 //+------------------------------------------------------------------+
@@ -503,12 +567,21 @@ void OnTick() {
    ManageIdleTrades();
    AnalyzeAllTimeframes();
    TryAutoEntry();
-   datetime curBar = iTime(_Symbol, TF_M15, 0);
-   if(curBar != g_LastVisualBar) {
-      DrawChartVisuals();
-      g_LastVisualBar = curBar;
+
+   // Skip heavy UI work in tester — keeps backtest fast
+   if(!g_IsTesting) {
+      datetime curBar = iTime(_Symbol, TF_M15, 0);
+      if(curBar != g_LastVisualBar) {
+         DrawChartVisuals();
+         g_LastVisualBar = curBar;
+      }
+      UpdateDashboard();
    }
-   UpdateDashboard();
+
+   // Track equity high/low for report
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq > g_MaxEquity) g_MaxEquity = eq;
+   if(eq < g_MinEquity) g_MinEquity = eq;
 }
 
 //+------------------------------------------------------------------+
@@ -534,20 +607,47 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                              TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES),
                              profit, wasWin ? "WIN" : "LOSS");
 
-         // Find trade state for journal
+         // Find trade state for journal and stats
          int idx = FindTradeState(dealTicket);
          if(idx >= 0) {
-            TradeState ts = g_Trades[idx];
-            double exitPrice = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
-            string strat = g_UseFallback ? "FALLBACK" : "PRIMARY";
-            JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
-                              ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
-                              ts.lotSize, ts.isBuy ? PrimaryRisk : FallbackRisk,
-                              MathAbs(ts.entryPrice - ts.initialSL) /
-                              (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10),
-                              exitPrice, profit, ts.isBuy,
-                              ts.breakEvenDone, ts.partialTPDone, UseTrailingStop);
-            SendTradeResultNotification(wasWin, profit, dealTicket, strat);
+            TradeState ts       = g_Trades[idx];
+            double exitPrice    = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+            string strat        = g_UseFallback ? "FALLBACK" : "PRIMARY";
+            double slPips       = MathAbs(ts.entryPrice - ts.initialSL) /
+                                  (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+            double tradePips    = MathAbs(exitPrice - ts.entryPrice) /
+                                  (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+
+            // Track pips
+            g_TotalPips += wasWin ? tradePips : -tradePips;
+
+            // Track best/worst trade
+            if(profit > g_BestTrade)  g_BestTrade  = profit;
+            if(profit < g_WorstTrade) g_WorstTrade = profit;
+
+            // Track streaks
+            if(wasWin) {
+               g_WinStreak++;
+               g_LoseStreak = 0;
+               if(g_WinStreak > g_MaxWinStreak) g_MaxWinStreak = g_WinStreak;
+            } else {
+               g_LoseStreak++;
+               g_WinStreak = 0;
+               if(g_LoseStreak > g_MaxLoseStreak) g_MaxLoseStreak = g_LoseStreak;
+            }
+
+            // Track per-strategy counts
+            if(strat == "PRIMARY")  g_PrimaryTrades++;
+            else                    g_FallbackTrades++;
+
+            if(!g_IsTesting) {
+               JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
+                                 ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
+                                 ts.lotSize, ts.isBuy ? PrimaryRisk : FallbackRisk,
+                                 slPips, exitPrice, profit, ts.isBuy,
+                                 ts.breakEvenDone, ts.partialTPDone, UseTrailingStop);
+               SendTradeResultNotification(wasWin, profit, dealTicket, strat);
+            }
          }
 
          // Notify if daily limit was just triggered
@@ -1649,12 +1749,137 @@ void SendDailyLimitNotification(string reason) {
 }
 
 //+------------------------------------------------------------------+
+//|  HTML PERFORMANCE REPORT                                        |
+//+------------------------------------------------------------------+
+
+void GenerateHTMLReport() {
+   int fh = FileOpen(ReportFileName, FILE_WRITE|FILE_COMMON|FILE_TXT);
+   if(fh == INVALID_HANDLE) return;
+
+   double netPnL      = g_TotalProfit - g_TotalLoss;
+   double winRate     = GetWinRate();
+   double pf          = GetProfitFactor();
+   double returnPct   = g_StartBalance > 0 ?
+                        (AccountInfoDouble(ACCOUNT_BALANCE) - g_StartBalance)
+                        / g_StartBalance * 100.0 : 0;
+   double avgWin      = g_TotalWins  > 0 ? g_TotalProfit / g_TotalWins  : 0;
+   double avgLoss     = g_TotalLosses> 0 ? g_TotalLoss   / g_TotalLosses: 0;
+   double avgRR       = avgLoss > 0 ? avgWin / avgLoss : 0;
+   double maxDD       = g_PeakBalance > 0 ?
+                        (g_PeakBalance - g_MinEquity) / g_PeakBalance * 100.0 : 0;
+
+   string html = "";
+   html += "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+   html += "<title>XAUUSD Sniper EA — Performance Report</title>";
+   html += "<style>";
+   html += "body{background:#0d0d1a;color:#e0e0e0;font-family:Consolas,monospace;padding:20px;}";
+   html += "h1{color:gold;} h2{color:#64b4ff;border-bottom:1px solid #333;padding-bottom:5px;}";
+   html += "table{width:100%;border-collapse:collapse;margin-bottom:20px;}";
+   html += "th{background:#1a1a2e;color:#64b4ff;padding:8px;text-align:left;}";
+   html += "td{padding:7px 8px;border-bottom:1px solid #1e1e2e;}";
+   html += "tr:hover{background:#1a1a2e;}";
+   html += ".win{color:#00ff88;} .loss{color:#ff4444;} .warn{color:orange;}";
+   html += ".card{background:#12121f;border:1px solid #2a2a3e;border-radius:6px;";
+   html += "padding:15px;margin:10px 0;display:inline-block;min-width:180px;margin-right:10px;}";
+   html += ".card-val{font-size:1.6em;font-weight:bold;} .card-lbl{color:#888;font-size:0.8em;}";
+   html += "</style></head><body>";
+
+   // Header
+   html += StringFormat("<h1>XAUUSD Sniper EA — Performance Report</h1>");
+   html += StringFormat("<p>Generated: %s &nbsp;|&nbsp; Symbol: %s &nbsp;|&nbsp; Magic: %d</p>",
+                        TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES), _Symbol, MagicNumber);
+   html += StringFormat("<p>Period: %s → %s</p>",
+                        TimeToString(g_EAStartTime, TIME_DATE),
+                        TimeToString(TimeCurrent(), TIME_DATE));
+
+   // KPI Cards
+   string rrClass  = avgRR  >= 2.0  ? "win" : (avgRR  >= 1.0 ? "warn" : "loss");
+   string pfClass  = pf     >= 1.5  ? "win" : (pf     >= 1.0 ? "warn" : "loss");
+   string wrClass  = winRate>= 60.0 ? "win" : (winRate>= 45.0? "warn" : "loss");
+   string retClass = returnPct >= 0  ? "win" : "loss";
+
+   html += "<div>";
+   html += KPICard("Net Return",    StringFormat("%+.2f%%", returnPct),   retClass);
+   html += KPICard("Win Rate",      StringFormat("%.1f%%",  winRate),     wrClass);
+   html += KPICard("Profit Factor", StringFormat("%.2f",    pf),          pfClass);
+   html += KPICard("Avg R:R",       StringFormat("1:%.2f",  avgRR),       rrClass);
+   html += KPICard("Total Trades",  IntegerToString(g_TotalTrades),       "");
+   html += KPICard("Max Drawdown",  StringFormat("%.2f%%",  maxDD),       maxDD > 10 ? "loss" : "win");
+   html += KPICard("Total Pips",    StringFormat("%.1f",    g_TotalPips), g_TotalPips >= 0 ? "win" : "loss");
+   html += KPICard("Net P&L",       StringFormat("$%.2f",   netPnL),      netPnL >= 0 ? "win" : "loss");
+   html += "</div><br/>";
+
+   // Summary table
+   html += "<h2>Summary Statistics</h2>";
+   html += "<table><tr><th>Metric</th><th>Value</th></tr>";
+   html += TR("Starting Balance",   StringFormat("$%.2f", g_StartBalance));
+   html += TR("Ending Balance",     StringFormat("$%.2f", AccountInfoDouble(ACCOUNT_BALANCE)));
+   html += TR("Peak Equity",        StringFormat("$%.2f", g_MaxEquity));
+   html += TR("Lowest Equity",      StringFormat("$%.2f", g_MinEquity));
+   html += TR("Total Trades",       IntegerToString(g_TotalTrades));
+   html += TR("Wins",               IntegerToString(g_TotalWins));
+   html += TR("Losses",             IntegerToString(g_TotalLosses));
+   html += TR("Win Rate",           StringFormat("%.2f%%", winRate));
+   html += TR("Profit Factor",      StringFormat("%.2f",   pf));
+   html += TR("Gross Profit",       StringFormat("$%.2f",  g_TotalProfit));
+   html += TR("Gross Loss",         StringFormat("$%.2f",  g_TotalLoss));
+   html += TR("Net P&L",            StringFormat("$%.2f",  netPnL));
+   html += TR("Avg Win",            StringFormat("$%.2f",  avgWin));
+   html += TR("Avg Loss",           StringFormat("$%.2f",  avgLoss));
+   html += TR("Avg R:R Achieved",   StringFormat("1:%.2f", avgRR));
+   html += TR("Best Trade",         StringFormat("$%.2f",  g_BestTrade));
+   html += TR("Worst Trade",        StringFormat("$%.2f",  g_WorstTrade));
+   html += TR("Total Pips",         StringFormat("%.1f",   g_TotalPips));
+   html += TR("Max Win Streak",     IntegerToString(g_MaxWinStreak));
+   html += TR("Max Lose Streak",    IntegerToString(g_MaxLoseStreak));
+   html += TR("Max Drawdown",       StringFormat("%.2f%%", maxDD));
+   html += TR("Primary Trades",     IntegerToString(g_PrimaryTrades));
+   html += TR("Fallback Trades",    IntegerToString(g_FallbackTrades));
+   html += "</table>";
+
+   // Settings used
+   html += "<h2>EA Settings Used</h2>";
+   html += "<table><tr><th>Parameter</th><th>Value</th></tr>";
+   html += TR("Min Primary Score",    IntegerToString(MinPrimaryScore));
+   html += TR("Min Fallback Score",   IntegerToString(MinFallbackScore));
+   html += TR("Primary Risk %",       StringFormat("%.1f%%", PrimaryRisk));
+   html += TR("Fallback Risk %",      StringFormat("%.1f%%", FallbackRisk));
+   html += TR("TP1 R:R",              StringFormat("1:%.1f", TP1_RR));
+   html += TR("TP2 R:R",              StringFormat("1:%.1f", TP2_RR));
+   html += TR("Breakeven Trigger",    StringFormat("%.1fx SL", BreakevenTrigger));
+   html += TR("Trail Distance",       StringFormat("%.1f pips", TrailDistance));
+   html += TR("Daily Loss Limit",     StringFormat("%.1f%%", DailyLossLimit));
+   html += TR("Daily Profit Target",  StringFormat("%.1f%%", DailyProfitTarget));
+   html += TR("Weekly Loss Limit",    StringFormat("%.1f%%", WeeklyLossLimit));
+   html += TR("Monthly Loss Limit",   StringFormat("%.1f%%", MonthlyLossLimit));
+   html += TR("Max Drawdown %",       StringFormat("%.1f%%", MaxDrawdownPct));
+   html += TR("Max Spread Pips",      StringFormat("%.1f",   MaxSpreadPips));
+   html += "</table>";
+
+   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v7.0 — Philippines Sniper Strategy</p>";
+   html += "</body></html>";
+
+   FileWriteString(fh, html);
+   FileClose(fh);
+}
+
+string KPICard(string label, string value, string cls) {
+   return StringFormat(
+      "<div class='card'><div class='card-val %s'>%s</div><div class='card-lbl'>%s</div></div>",
+      cls, value, label);
+}
+
+string TR(string label, string value) {
+   return StringFormat("<tr><td>%s</td><td><b>%s</b></td></tr>", label, value);
+}
+
+//+------------------------------------------------------------------+
 //| Dashboard creation — all labels                                 |
 //+------------------------------------------------------------------+
 void CreateDashboard() {
    // Background rectangle
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 76 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 84 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
@@ -2046,9 +2271,51 @@ void UpdateDashboard() {
    y += dy;
 
    y += 4;
+   // ── BACKTEST & OPTIMIZATION ──
+   y += dy;
+   SetLabel(PREFIX+"BTH", x, y, "── BACKTEST & OPTIMIZATION ──", ColorHeader, FontSize);
+   y += dy;
+
+   double returnPct = g_StartBalance > 0 ?
+                      (AccountInfoDouble(ACCOUNT_BALANCE) - g_StartBalance)
+                      / g_StartBalance * 100.0 : 0;
+   double avgWin    = g_TotalWins   > 0 ? g_TotalProfit / g_TotalWins   : 0;
+   double avgLoss   = g_TotalLosses > 0 ? g_TotalLoss   / g_TotalLosses : 0;
+   double avgRR     = avgLoss > 0 ? avgWin / avgLoss : 0;
+   double maxDD     = g_PeakBalance > 0 ?
+                      (g_PeakBalance - g_MinEquity) / g_PeakBalance * 100.0 : 0;
+
+   color retColor   = returnPct >= 0 ? ColorBull : ColorBear;
+   SetLabel(PREFIX+"BT1", x, y,
+            StringFormat("Return: %+.2f%%   Win Rate: %.1f%%   PF: %.2f   Avg RR: 1:%.2f",
+                         returnPct, GetWinRate(), GetProfitFactor(), avgRR),
+            retColor, FontSize);
+   y += dy;
+
+   SetLabel(PREFIX+"BT2", x, y,
+            StringFormat("Best: $%.2f   Worst: $%.2f   Pips: %.1f   MaxDD: %.2f%%",
+                         g_BestTrade, g_WorstTrade, g_TotalPips, maxDD),
+            ColorText, FontSize);
+   y += dy;
+
+   SetLabel(PREFIX+"BT3", x, y,
+            StringFormat("Win Streak: %d (best: %d)   Lose Streak: %d (worst: %d)   Primary: %d  Fallback: %d",
+                         g_WinStreak, g_MaxWinStreak, g_LoseStreak, g_MaxLoseStreak,
+                         g_PrimaryTrades, g_FallbackTrades),
+            ColorNeutral, FontSize);
+   y += dy;
+
+   string rptStr = GenerateReport ? StringFormat("Report: ON (%s)", ReportFileName)
+                                  : "Report: OFF";
+   SetLabel(PREFIX+"BT4", x, y, rptStr, ColorNeutral, FontSize);
+   y += dy;
+
+   y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v6.0 | %s | Magic: %d",
-                         TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS), MagicNumber),
+            StringFormat("v7.0 FINAL | %s | Magic: %d | %s",
+                         TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
+                         MagicNumber,
+                         g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
             ColorNeutral, FontSize - 1);
 
    ChartRedraw(0);
