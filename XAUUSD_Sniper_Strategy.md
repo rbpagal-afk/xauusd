@@ -345,13 +345,222 @@ RR = 1:3 minimum ✅
 
 ---
 
+## Fallback Strategy — H1 → M15 → M5
+
+> Use this ONLY when H4/H1/M15 produces NO valid confluence setup.
+> Same rules, same concepts, just one timeframe lower.
+
+---
+
+### When to Switch to Fallback
+
+```
+H4/H1/M15 PRIMARY STRATEGY FIRST
+       │
+       ├── Confluences found? ──► TRADE IT (Primary)
+       │
+       └── No confluences found?
+                  │
+                  └──► DROP TO H1/M15/M5 FALLBACK
+```
+
+**Conditions to switch:**
+- No clear BOS on H4
+- No valid Order Block on H1
+- Price is ranging with no direction on H4
+- Score is below 7 on primary setup
+- You have checked primary and found nothing by 4:00 PM PHT
+
+---
+
+### Fallback Timeframe Roles
+
+| Timeframe | Role | Purpose |
+|---|---|---|
+| H1 | Higher Timeframe (HTF) | Trend direction & major zones |
+| M15 | Middle Timeframe (MTF) | Key levels, OB, FVG |
+| M5 | Lower Timeframe (LTF) | Sniper entry trigger |
+
+---
+
+### Step 1 — H1 Analysis (Bias & Direction)
+
+Same as H4 analysis but now on H1:
+
+```
+□ BOS on H1 identified (bullish or bearish)
+□ Major Order Block marked on H1
+□ Price in Premium or Discount zone on H1
+□ Draw on Liquidity identified on H1
+```
+
+- Bullish BOS on H1 = only look for BUYS on M5
+- Bearish BOS on H1 = only look for SELLS on M5
+
+---
+
+### Step 2 — M15 Analysis (Zone Identification)
+
+Same as H1 analysis but now on M15:
+
+```
+□ CHoCH confirmed on M15 in direction of H1 bias
+□ M15 Order Block identified and marked
+□ FVG present within or near the M15 Order Block
+□ Zone aligns with H1 OB or key level
+```
+
+---
+
+### Step 3 — M5 Entry (Sniper Trigger)
+
+Same as M15 entry but now on M5:
+
+```
+□ Price has reached the M15 Order Block zone
+□ Liquidity sweep occurred on M5 (wick grabs stops)
+□ M5 CHoCH confirmed after sweep
+□ Confirmation candle (engulfing or strong close) on M5
+□ M5 FVG present above/below entry
+□ Enter at 50% of the M5 FVG
+```
+
+---
+
+### Fallback Sniper Entry Model
+
+```
+H1  → Bullish BOS confirmed
+      Price in Discount zone
+      H1 Bullish Order Block at zone
+           │
+M15 → CHoCH bullish confirmed
+      M15 FVG present at zone
+      Aligns with H1 OB
+           │
+M5  → Price sweeps liquidity LOW
+      M5 CHoCH forms immediately after
+      Bullish engulfing candle closes
+      M5 FVG created above entry
+           │
+           ▼
+ENTER BUY at 50% of M5 FVG
+SL below the M5 sweep wick + 5 pip buffer
+TP1 at M15 swing high (close 50%)
+TP2 at H1 swing high (close remaining 50%)
+RR = 1:2 minimum ✅
+```
+
+---
+
+### Fallback Confluence Scoring
+
+Same scoring system, same points, applied to lower timeframes:
+
+| Factor | Points |
+|---|---|
+| H1 BOS in trade direction | +2 |
+| Price in correct Premium/Discount on H1 | +1 |
+| H1 Order Block present | +2 |
+| M15 CHoCH confirmed | +2 |
+| M15 FVG aligns with H1 OB | +1 |
+| M5 Liquidity Sweep occurred | +2 |
+| M5 CHoCH after sweep | +1 |
+| M5 Confirmation candle | +1 |
+| M5 FVG entry point | +1 |
+| **Total Possible** | **13** |
+
+- **10-13 = SNIPER ENTRY — Take the trade**
+- **7-9  = VALID SETUP — Take with smaller size**
+- **4-6  = WAIT — Not ready**
+- **0-3  = NO TRADE — Skip**
+
+---
+
+### Key Differences — Primary vs Fallback
+
+| | Primary (H4/H1/M15) | Fallback (H1/M15/M5) |
+|---|---|---|
+| Signal strength | Stronger | Slightly weaker |
+| Trade duration | 2-8 hours | 30 min - 2 hours |
+| Risk per trade | Up to 2% | Maximum 1% |
+| Min RR required | 1:2 (prefer 1:3) | 1:2 only |
+| False signals | Less | More |
+| Required score | 7+ | 9+ (stricter) |
+| Max trades/day | 2 | 1 additional only |
+
+> **Important:** The fallback requires a HIGHER score (9+) because
+> lower timeframes have more noise and false signals.
+
+---
+
+### Fallback Rules — Never Break These
+
+1. **Only use fallback if primary H4/H1/M15 has no setup**
+2. **Score must be 9 or higher** — stricter than primary
+3. **Maximum 1 fallback trade per day**
+4. **Risk only 1%** — half of normal risk
+5. **H1 bias must still align** — if H1 is bearish, only sell on M5
+6. **Only during London or NY session** — same session rules apply
+7. **Do not use fallback after a primary trade loss** — stop for the day
+
+---
+
+### Full Decision Flow — Philippines Time
+
+```
+8:00 AM - 3:00 PM PHT
+│  PREPARATION
+│  Mark zones on H4, H1, M15
+│
+3:00 PM PHT (London Open)
+│
+├── Check H4/H1/M15 confluence
+│       │
+│       ├── Score 7+? ──► ENTER PRIMARY TRADE ✅
+│       │
+│       └── Score below 7 / No setup?
+│                   │
+│                   └── Check H1/M15/M5 confluence
+│                               │
+│                               ├── Score 9+? ──► ENTER FALLBACK TRADE ✅
+│                               │
+│                               └── Score below 9? ──► NO TRADE ❌
+│                                                       Wait for NY open
+│
+8:00 PM PHT (New York Open)
+│
+├── Check H4/H1/M15 confluence
+│       │
+│       ├── Score 7+? ──► ENTER PRIMARY TRADE ✅
+│       │
+│       └── No setup?
+│                   │
+│                   └── Check H1/M15/M5 confluence
+│                               │
+│                               ├── Score 9+? ──► ENTER FALLBACK TRADE ✅
+│                               │
+│                               └── Score below 9? ──► NO TRADE ❌
+│                                                       Close charts, rest
+│
+10:00 PM PHT ──► STOP TRADING
+```
+
+---
+
 ## Summary
 
 > This strategy works because it follows what INSTITUTIONS do.
 > They accumulate orders at key levels (Order Blocks),
 > they hunt retail stop losses (Liquidity Sweeps),
 > and they leave imbalances in the market (FVGs).
-> 
-> By reading these footprints across H4, H1, and M15,
-> you enter AFTER the institutions have shown their hand —
-> that is the sniper entry.
+>
+> PRIMARY: H4 → H1 → M15
+> Read the big picture, find the zone, snipe the entry.
+>
+> FALLBACK: H1 → M15 → M5
+> Same concept, one level lower, stricter rules.
+>
+> By reading these footprints across both setups,
+> you always have a plan — but you never force a trade.
+> No confluence = no trade. That is the discipline.
