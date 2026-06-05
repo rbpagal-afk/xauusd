@@ -113,7 +113,13 @@ input bool             AlertOnSignal     = true;   // Send alert when signal is 
 input int              MagicNumber       = 202401; // EA magic number
 input double           SL_BufferPips     = 5.0;    // Extra pips beyond sweep for SL
 input int              CooldownBars      = 3;      // Bars to wait after last trade before new entry
-input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time
+input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time (overridden by scaled entries)
+
+input group            "=== SCALED ENTRIES (SCORE-BASED) ==="
+input bool             UseScaledEntries  = true;   // Scale max simultaneous trades by confluence score
+input int              ScaledScore1      = 8;      // Score threshold for 1 entry
+input int              ScaledScore2      = 9;      // Score threshold for 2 simultaneous entries
+input int              ScaledScore3      = 10;     // Score threshold for 3 simultaneous entries
 
 input group            "=== CHART VISUALS ==="
 input bool             ShowOB            = true;   // Draw Order Block boxes on chart
@@ -1055,6 +1061,21 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //+------------------------------------------------------------------+
+//| Score-based entry scaling — returns max open trades allowed     |
+//| Score >= ScaledScore3 → 3 trades                                |
+//| Score >= ScaledScore2 → 2 trades                                |
+//| Score >= ScaledScore1 → 1 trade                                 |
+//| Score <  ScaledScore1 → 0 trades (signal too weak)             |
+//+------------------------------------------------------------------+
+int GetMaxEntriesForScore(int score) {
+   if(!UseScaledEntries) return (OneTradeAtATime ? 1 : 99);
+   if(score >= ScaledScore3) return 3;
+   if(score >= ScaledScore2) return 2;
+   if(score >= ScaledScore1) return 1;
+   return 0;
+}
+
+//+------------------------------------------------------------------+
 //| Auto Entry — fires when confluence score meets threshold         |
 //+------------------------------------------------------------------+
 void TryAutoEntry() {
@@ -1066,12 +1087,9 @@ void TryAutoEntry() {
                      g_Session == "London Session (Selective)");
    if(!inSession) { g_AlertSent = false; return; }
 
-   // Check cooldown — wait CooldownBars after last trade
+   // Check cooldown — wait for new bar between entries
    datetime currentBar = iTime(_Symbol, TF_M15, 0);
    if(currentBar == g_LastEntryBar) return;
-
-   // One trade at a time check
-   if(OneTradeAtATime && CountOpenTrades() > 0) return;
 
    // Determine which strategy triggered
    // Use dynamic thresholds (self-adjusted by learning system)
@@ -1093,6 +1111,21 @@ void TryAutoEntry() {
    int    score     = primaryReady ? g_PrimaryScore : g_FallbackScore;
    double riskPct   = primaryReady ? PrimaryRisk : FallbackRisk;
    string strategy  = primaryReady ? "PRIMARY" : "FALLBACK";
+
+   // ── SCALED ENTRY GATE — check how many trades are already open ──
+   int openNow    = CountOpenTrades();
+   int maxAllowed = GetMaxEntriesForScore(score);
+   if(maxAllowed == 0) {
+      g_EntryLog = StringFormat("SCALED: Score %d below entry threshold (need %d for 1 entry)",
+                                score, ScaledScore1);
+      g_AlertSent = false;
+      return;
+   }
+   if(openNow >= maxAllowed) {
+      g_EntryLog = StringFormat("SCALED: %d/%d trades open for score %d — waiting for close or higher score",
+                                openNow, maxAllowed, score);
+      return;
+   }
 
    // ── BRIDGE STATE MACHINE ──
    if(UseBridge) {
@@ -1579,7 +1612,12 @@ void WriteStatusFile() {
    FileWriteString(fh, StringFormat("daily_pnl=%+.2f\n", g_DailyPnL));
    FileWriteString(fh, StringFormat("weekly_pnl=%+.2f\n",g_WeeklyPnL));
    FileWriteString(fh, StringFormat("drawdown=%.2f\n",   g_CurrentDrawdown));
-   FileWriteString(fh, StringFormat("open_trades=%d\n",  CountOpenTrades()));
+   int openNowSt  = CountOpenTrades();
+   int curScoreSt = g_UseFallback ? g_FallbackScore : g_PrimaryScore;
+   int maxEntSt   = GetMaxEntriesForScore(curScoreSt);
+   FileWriteString(fh, StringFormat("open_trades=%d\n",     openNowSt));
+   FileWriteString(fh, StringFormat("max_entries=%d\n",     maxEntSt));
+   FileWriteString(fh, StringFormat("scaled_score=%d\n",    curScoreSt));
    FileWriteString(fh, StringFormat("daily_trades=%d/%d\n", g_DailyTradeCount, MaxDailyTrades));
    FileWriteString(fh, StringFormat("session=%s\n",      g_Session));
    FileWriteString(fh, StringFormat("primary_score=%d\n",g_PrimaryScore));
@@ -2069,26 +2107,35 @@ string GetRecommendation() {
 
    // Primary strategy
    if(g_PrimaryScore >= effPrim) {
-      string dir   = g_H4.bullish ? "BUY" : "SELL";
-      double slPips = 15.0;
-      double lots   = CalcLotSize(PrimaryRisk, slPips);
-      g_LastLotSize = lots;
-      return StringFormat("PRIMARY TRADE: %s | Score %d/42 (need %d) | Risk %.1f%% | Lots: %.2f",
-                          dir, g_PrimaryScore, effPrim, PrimaryRisk, lots);
+      string dir     = g_H4.bullish ? "BUY" : "SELL";
+      double slPips  = 15.0;
+      double lots    = CalcLotSize(PrimaryRisk, slPips);
+      g_LastLotSize  = lots;
+      int    maxEnt  = GetMaxEntriesForScore(g_PrimaryScore);
+      int    openNow = CountOpenTrades();
+      string entStr  = StringFormat("%d/%d entries open", openNow, maxEnt);
+      return StringFormat("PRIMARY TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f | Entries: %s",
+                          dir, g_PrimaryScore, PrimaryRisk, lots, entStr);
    }
 
    // Fallback strategy
    if(g_FallbackScore >= effFall) {
-      string dir   = g_H1.bullish ? "BUY" : "SELL";
-      double slPips = 10.0;
-      double lots   = CalcLotSize(FallbackRisk, slPips);
-      g_LastLotSize = lots;
-      return StringFormat("FALLBACK TRADE: %s | Score %d/42 (need %d) | Risk %.1f%% | Lots: %.2f",
-                          dir, g_FallbackScore, effFall, FallbackRisk, lots);
+      string dir     = g_H1.bullish ? "BUY" : "SELL";
+      double slPips  = 10.0;
+      double lots    = CalcLotSize(FallbackRisk, slPips);
+      g_LastLotSize  = lots;
+      int    maxEnt  = GetMaxEntriesForScore(g_FallbackScore);
+      int    openNow = CountOpenTrades();
+      string entStr  = StringFormat("%d/%d entries open", openNow, maxEnt);
+      return StringFormat("FALLBACK TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f | Entries: %s",
+                          dir, g_FallbackScore, FallbackRisk, lots, entStr);
    }
 
-   return StringFormat("NO TRADE — Primary: %d/42 (need %d) | Fallback: %d/42 (need %d)",
-                       g_PrimaryScore, effPrim, g_FallbackScore, effFall);
+   // Show how far each score is from scaled thresholds
+   string scaleHint = UseScaledEntries ?
+      StringFormat(" | Need %d for 1-entry, %d for 2, %d for 3", ScaledScore1, ScaledScore2, ScaledScore3) : "";
+   return StringFormat("NO TRADE — Primary: %d/42 (need %d) | Fallback: %d/42 (need %d)%s",
+                       g_PrimaryScore, effPrim, g_FallbackScore, effFall, scaleHint);
 }
 
 //+------------------------------------------------------------------+
@@ -3268,6 +3315,26 @@ void UpdateDashboard() {
    color autoColor = AutoTrade ? ColorBull : ColorWarn;
    SetLabel(PREFIX+"AE1", x, y, autoMode, autoColor, FontSize);
    y += dy;
+
+   // Scaled entry status
+   if(UseScaledEntries) {
+      int    curScore  = g_UseFallback ? g_FallbackScore : g_PrimaryScore;
+      int    maxEnt    = GetMaxEntriesForScore(curScore);
+      int    openNow2  = CountOpenTrades();
+      string scaleStr  = StringFormat(
+         "Scaled Entries: Score %d → %s max  |  Open: %d/%d  |  "
+         "Thresholds: %d→1entry  %d→2entries  %d→3entries",
+         curScore,
+         maxEnt == 0 ? "0 (below threshold)" :
+         maxEnt == 1 ? "1" : maxEnt == 2 ? "2" : "3",
+         openNow2, maxEnt > 0 ? maxEnt : 1,
+         ScaledScore1, ScaledScore2, ScaledScore3);
+      color scaleClr = (maxEnt >= 3) ? ColorBull :
+                       (maxEnt == 2) ? ColorWarn :
+                       (maxEnt == 1) ? ColorText : ColorBear;
+      SetLabel(PREFIX+"AES", x, y, scaleStr, scaleClr, FontSize);
+      y += dy;
+   }
 
    if(g_EntryLog != "") {
       color logColor = (StringFind(g_EntryLog, "ENTERED") >= 0)  ? ColorBull  :
