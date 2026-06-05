@@ -23,12 +23,14 @@ input int              BOS_Lookback      = 50;     // BOS lookback bars
 input int              OB_Lookback       = 10;     // Order Block lookback bars
 input int              FVG_Lookback      = 5;      // FVG lookback bars
 input int              Sweep_Lookback    = 5;      // Liquidity Sweep lookback bars
-input int              MinPrimaryScore   = 7;      // Min score for primary trade
-input int              MinFallbackScore  = 9;      // Min score for fallback trade
+input int              MinPrimaryScore   = 7;      // Min score for primary trade (H4→H1→M15)
+input int              MinFallbackScore  = 9;      // Min score for fallback trade (H1→M15→M5)
+input int              MinTertiaryScore  = 11;     // Min score for tertiary scalp (M15→M5→M1)
 
 input group            "=== RISK PER TRADE ==="
-input double           PrimaryRisk       = 2.0;    // Primary risk % per trade
-input double           FallbackRisk      = 1.0;    // Fallback risk % per trade
+input double           PrimaryRisk       = 2.0;    // Primary risk % (H4→H1→M15)
+input double           FallbackRisk      = 1.0;    // Fallback risk % (H1→M15→M5)
+input double           TertiaryRisk      = 0.5;    // Tertiary risk % (M15→M5→M1 scalp)
 input double           MinRR             = 2.0;    // Minimum Risk:Reward
 
 input group            "=== DAILY PROFIT & LOSS LIMITS ==="
@@ -199,14 +201,17 @@ ENUM_TIMEFRAMES TF_H4   = PERIOD_H4;
 ENUM_TIMEFRAMES TF_H1   = PERIOD_H1;
 ENUM_TIMEFRAMES TF_M15  = PERIOD_M15;
 ENUM_TIMEFRAMES TF_M5   = PERIOD_M5;
+ENUM_TIMEFRAMES TF_M1   = PERIOD_M1;
 
 //--- Global state — uses advanced SMC engine (SMCAnalysis from SMC_Engine.mqh)
-SMCAnalysis g_H4, g_H1, g_M15, g_M5;
+SMCAnalysis g_H4, g_H1, g_M15, g_M5, g_M1;
 int        g_PrimaryScore   = 0;
 int        g_FallbackScore  = 0;
+int        g_TertiaryScore  = 0;
 string     g_Session        = "";
 string     g_Recommendation = "";
 bool       g_UseFallback    = false;
+bool       g_UseTertiary    = false;
 datetime   g_LastUpdate     = 0;
 
 //--- Capital protection state per ticket
@@ -308,10 +313,12 @@ SessionStats    g_SessStats[SESSION_COUNT];
 TradeSnapshot   g_Snapshots[];           // Parallel array with g_Trades
 
 //--- Dynamic thresholds (start at input values, self-adjust over time)
-int    g_DynPrimaryScore  = 0;   // Initialized from MinPrimaryScore in OnInit
-int    g_DynFallbackScore = 0;   // Initialized from MinFallbackScore in OnInit
-int    g_PrimaryWins      = 0;
-int    g_FallbackWins     = 0;
+int    g_DynPrimaryScore   = 0;   // Initialized from MinPrimaryScore in OnInit
+int    g_DynFallbackScore  = 0;   // Initialized from MinFallbackScore in OnInit
+int    g_DynTertiaryScore  = 0;   // Initialized from MinTertiaryScore in OnInit
+int    g_PrimaryWins       = 0;
+int    g_FallbackWins      = 0;
+int    g_TertiaryWins      = 0;
 int    g_BatchTradeCount  = 0;   // Counts toward next adjustment cycle
 string g_LearnStatus      = "Learning: accumulating trades...";
 
@@ -377,6 +384,7 @@ double     g_WorstTrade        = 0;      // Worst single trade loss
 double     g_TotalPips         = 0;      // Total pips won/lost
 int        g_PrimaryTrades     = 0;      // Trades taken by primary strategy
 int        g_FallbackTrades    = 0;      // Trades taken by fallback strategy
+int        g_TertiaryTrades    = 0;      // Trades taken by tertiary scalp strategy
 datetime   g_EAStartTime       = 0;      // When EA started
 
 //--- Drawdown tracking
@@ -422,8 +430,9 @@ int OnInit() {
    ResetMonthlyTracking();
 
    // Initialize adaptive learning
-   g_DynPrimaryScore  = MinPrimaryScore;
-   g_DynFallbackScore = MinFallbackScore;
+   g_DynPrimaryScore   = MinPrimaryScore;
+   g_DynFallbackScore  = MinFallbackScore;
+   g_DynTertiaryScore  = MinTertiaryScore;
    ArrayInitialize(g_Snapshots, 0);
    if(!g_IsTesting) LoadLearningData();
 
@@ -1038,8 +1047,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             }
 
             // Track per-strategy counts
-            if(strat == "PRIMARY")  g_PrimaryTrades++;
-            else                    g_FallbackTrades++;
+            if(strat == "PRIMARY")   g_PrimaryTrades++;
+            else if(strat == "FALLBACK") g_FallbackTrades++;
+            else                     g_TertiaryTrades++;
 
             // Update adaptive learning stats
             UpdateLearningStats(dealTicket, wasWin, strat);
@@ -1050,7 +1060,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             if(!g_IsTesting) {
                JournalWriteTrade(dealTicket, strat, g_LastSignalScore,
                                  ts.entryPrice, ts.initialSL, ts.tp1Price, ts.tp2Price,
-                                 ts.lotSize, strat == "PRIMARY" ? PrimaryRisk : FallbackRisk,
+                                 ts.lotSize,
+                                 strat == "PRIMARY"   ? PrimaryRisk  :
+                                 strat == "FALLBACK"  ? FallbackRisk : TertiaryRisk,
                                  slPips, exitPrice, profit, ts.isBuy,
                                  ts.breakEvenDone, ts.partialTPDone, UseTrailingStop);
                SendTradeResultNotification(wasWin, profit, dealTicket, strat);
@@ -1101,6 +1113,7 @@ void TryAutoEntry() {
    // Use dynamic thresholds (self-adjusted by learning system)
    int    effectivePrimScore  = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
    int    effectiveFallScore  = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
+   int    effectiveTertScore  = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
 
    // Check session suspension
    if(IsSessionSuspended()) {
@@ -1109,14 +1122,42 @@ void TryAutoEntry() {
       return;
    }
 
-   bool   primaryReady  = (g_PrimaryScore  >= effectivePrimScore);
-   bool   fallbackReady = (g_FallbackScore >= effectiveFallScore) && !primaryReady;
-   if(!primaryReady && !fallbackReady) { g_AlertSent = false; return; }
+   // ── 3-TIER CASCADE: Primary → Fallback → Tertiary ──
+   // Tier 1: H4 → H1 → M15
+   bool primaryReady  = (g_PrimaryScore  >= effectivePrimScore);
+   // Tier 2: H1 → M15 → M5 (only when primary not ready)
+   bool fallbackReady = !primaryReady && (g_FallbackScore >= effectiveFallScore);
+   // Tier 3: M15 → M5 → M1 (only when both primary and fallback not ready)
+   bool tertiaryReady = !primaryReady && !fallbackReady && (g_TertiaryScore >= effectiveTertScore);
 
-   bool   isBuy     = primaryReady ? g_H4.bullish : g_H1.bullish;
-   int    score     = primaryReady ? g_PrimaryScore : g_FallbackScore;
-   double riskPct   = primaryReady ? PrimaryRisk : FallbackRisk;
-   string strategy  = primaryReady ? "PRIMARY" : "FALLBACK";
+   if(!primaryReady && !fallbackReady && !tertiaryReady) { g_AlertSent = false; return; }
+
+   // Pick the active tier
+   bool   isBuy;
+   int    score;
+   double riskPct;
+   string strategy;
+   ENUM_TIMEFRAMES entryTF;
+
+   if(primaryReady) {
+      isBuy    = g_H4.bullish;
+      score    = g_PrimaryScore;
+      riskPct  = PrimaryRisk;
+      strategy = "PRIMARY";
+      entryTF  = TF_M15;
+   } else if(fallbackReady) {
+      isBuy    = g_H1.bullish;
+      score    = g_FallbackScore;
+      riskPct  = FallbackRisk;
+      strategy = "FALLBACK";
+      entryTF  = TF_M5;
+   } else {
+      isBuy    = g_M15.bullish;
+      score    = g_TertiaryScore;
+      riskPct  = TertiaryRisk;
+      strategy = "TERTIARY";
+      entryTF  = TF_M1;
+   }
 
    // ── SCALED ENTRY GATE — check how many trades are already open ──
    int openNow    = CountOpenTrades();
@@ -1161,10 +1202,9 @@ void TryAutoEntry() {
    }
 
    // ── CANDLE CONFIRMATION CHECK ──
-   ENUM_TIMEFRAMES entryTF = primaryReady ? TF_M15 : TF_M5;
    if(!CheckCandleConfirmation(isBuy, entryTF)) {
       g_EntryLog = StringFormat("CANDLE: Waiting for confirmation on %s — %s",
-                                primaryReady ? "M15" : "M5", g_CandlePattern);
+                                TFToString(entryTF), g_CandlePattern);
       g_AlertSent = false;
       return;
    }
@@ -1174,7 +1214,7 @@ void TryAutoEntry() {
 
    // Calculate SL from recent sweep wick
    double pip    = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
-   double slRef  = GetSweepLevel(isBuy, primaryReady ? TF_M15 : TF_M5);
+   double slRef  = GetSweepLevel(isBuy, entryTF);
    double slPips = MathAbs((isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                   : SymbolInfoDouble(_Symbol, SYMBOL_BID)) - slRef)
                    / pip + SL_BufferPips;
@@ -1477,14 +1517,22 @@ void AnalyzeAllTimeframes() {
    g_H1  = AnalyzeSMC(_Symbol, TF_H1,  "H1",  BOS_Lookback);
    g_M15 = AnalyzeSMC(_Symbol, TF_M15, "M15", BOS_Lookback);
    g_M5  = AnalyzeSMC(_Symbol, TF_M5,  "M5",  BOS_Lookback);
+   g_M1  = AnalyzeSMC(_Symbol, TF_M1,  "M1",  BOS_Lookback);
 
    UpdateDXY();
    UpdateNewsCalendar();
 
    g_PrimaryScore   = ScorePrimaryAdvanced(g_H4, g_H1, g_M15);
    g_FallbackScore  = ScoreFallbackAdvanced(g_H1, g_M15, g_M5);
+   g_TertiaryScore  = ScoreTertiaryAdvanced(g_M15, g_M5, g_M1);
    g_Session        = GetSession();
-   g_UseFallback    = (g_PrimaryScore < MinPrimaryScore);
+
+   int effPrim = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
+   int effFall = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
+   int effTert = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
+
+   g_UseFallback  = (g_PrimaryScore  < effPrim);
+   g_UseTertiary  = (g_PrimaryScore  < effPrim) && (g_FallbackScore < effFall);
    g_Recommendation = GetRecommendation();
 }
 
@@ -1626,8 +1674,9 @@ void WriteStatusFile() {
    FileWriteString(fh, StringFormat("scaled_score=%d\n",    curScoreSt));
    FileWriteString(fh, StringFormat("daily_trades=%d/%d\n", g_DailyTradeCount, MaxDailyTrades));
    FileWriteString(fh, StringFormat("session=%s\n",      g_Session));
-   FileWriteString(fh, StringFormat("primary_score=%d\n",g_PrimaryScore));
-   FileWriteString(fh, StringFormat("fallback_score=%d\n",g_FallbackScore));
+   FileWriteString(fh, StringFormat("primary_score=%d\n",   g_PrimaryScore));
+   FileWriteString(fh, StringFormat("fallback_score=%d\n",  g_FallbackScore));
+   FileWriteString(fh, StringFormat("tertiary_score=%d\n",  g_TertiaryScore));
    FileWriteString(fh, StringFormat("paused=%s\n",       g_TradingPaused ? "true" : "false"));
    FileWriteString(fh, StringFormat("gate=%s\n",         IsTradingAllowed() ? "OPEN" : "CLOSED"));
    FileWriteString(fh, StringFormat("block_reason=%s\n", g_BlockReason));
@@ -1928,8 +1977,10 @@ void UpdateLearningStats(ulong ticket, bool wasWin, string strategy) {
    // Update per-strategy win counters
    if(strategy == "PRIMARY") {
       if(wasWin) g_PrimaryWins++;
-   } else {
+   } else if(strategy == "FALLBACK") {
       if(wasWin) g_FallbackWins++;
+   } else {
+      if(wasWin) g_TertiaryWins++;
    }
 
    g_BatchTradeCount++;
@@ -1965,9 +2016,19 @@ void AdjustThresholds() {
          g_DynFallbackScore--;
    }
 
+   // Tertiary threshold adjustment
+   if(g_TertiaryTrades >= MinTradesForAdjust) {
+      double tertWR = (double)g_TertiaryWins / g_TertiaryTrades * 100.0;
+      if(tertWR < 40.0 && g_DynTertiaryScore < MinTertiaryScore + 5)
+         g_DynTertiaryScore++;
+      else if(tertWR > 70.0 && g_DynTertiaryScore > MinTertiaryScore - 2)
+         g_DynTertiaryScore--;
+   }
+
    // Clamp to safe bounds
    g_DynPrimaryScore  = MathMax(5,  MathMin(20, g_DynPrimaryScore));
    g_DynFallbackScore = MathMax(7,  MathMin(22, g_DynFallbackScore));
+   g_DynTertiaryScore = MathMax(9,  MathMin(25, g_DynTertiaryScore));
 
    // Build status string
    double primWR  = g_PrimaryTrades  > 0 ? (double)g_PrimaryWins  / g_PrimaryTrades  * 100.0 : 0;
@@ -2012,10 +2073,11 @@ void SaveLearningData() {
    FileWriteString(fh, "XAUUSD_SNIPER_LEARNING_V1\n");
 
    // Dynamic thresholds
-   FileWriteString(fh, StringFormat("THRESH,%d,%d,%d,%d,%d,%d\n",
-      g_DynPrimaryScore, g_DynFallbackScore,
-      g_PrimaryTrades, g_PrimaryWins,
-      g_FallbackTrades, g_FallbackWins));
+   FileWriteString(fh, StringFormat("THRESH,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+      g_DynPrimaryScore, g_DynFallbackScore, g_DynTertiaryScore,
+      g_PrimaryTrades,   g_PrimaryWins,
+      g_FallbackTrades,  g_FallbackWins,
+      g_TertiaryTrades,  g_TertiaryWins));
 
    // Confluence stats
    for(int i = 0; i < CONFLUENCE_COUNT; i++) {
@@ -2057,12 +2119,15 @@ void LoadLearningData() {
       string tag = parts[0];
 
       if(tag == "THRESH" && n >= 7) {
-         g_DynPrimaryScore  = (int)StringToInteger(parts[1]);
-         g_DynFallbackScore = (int)StringToInteger(parts[2]);
-         g_PrimaryTrades    = (int)StringToInteger(parts[3]);
-         g_PrimaryWins      = (int)StringToInteger(parts[4]);
-         g_FallbackTrades   = (int)StringToInteger(parts[5]);
-         g_FallbackWins     = (int)StringToInteger(parts[6]);
+         g_DynPrimaryScore   = (int)StringToInteger(parts[1]);
+         g_DynFallbackScore  = (int)StringToInteger(parts[2]);
+         if(n >= 10) g_DynTertiaryScore = (int)StringToInteger(parts[3]);
+         g_PrimaryTrades     = (int)StringToInteger(n >= 10 ? parts[4] : parts[3]);
+         g_PrimaryWins       = (int)StringToInteger(n >= 10 ? parts[5] : parts[4]);
+         g_FallbackTrades    = (int)StringToInteger(n >= 10 ? parts[6] : parts[5]);
+         g_FallbackWins      = (int)StringToInteger(n >= 10 ? parts[7] : parts[6]);
+         if(n >= 10) { g_TertiaryTrades = (int)StringToInteger(parts[8]);
+                       g_TertiaryWins   = (int)StringToInteger(parts[9]); }
       }
       else if(tag == "CONF" && n >= 6) {
          int idx = (int)StringToInteger(parts[1]);
@@ -2105,43 +2170,52 @@ string GetRecommendation() {
 
    int effPrim = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
    int effFall = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
+   int effTert = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
 
    // Check session suspension
    if(IsSessionSuspended())
       return StringFormat("SESSION SUSPENDED by learning system — %s below %.0f%% win rate",
                           g_Session, MinSessionWinRate);
 
-   // Primary strategy
+   int openNow = CountOpenTrades();
+
+   // Tier 1 — Primary: H4 → H1 → M15
    if(g_PrimaryScore >= effPrim) {
-      string dir     = g_H4.bullish ? "BUY" : "SELL";
-      double slPips  = 15.0;
-      double lots    = CalcLotSize(PrimaryRisk, slPips);
-      g_LastLotSize  = lots;
-      int    maxEnt  = GetMaxEntriesForScore(g_PrimaryScore);
-      int    openNow = CountOpenTrades();
-      string entStr  = StringFormat("%d/%d entries open", openNow, maxEnt);
-      return StringFormat("PRIMARY TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f | Entries: %s",
-                          dir, g_PrimaryScore, PrimaryRisk, lots, entStr);
+      string dir    = g_H4.bullish ? "BUY" : "SELL";
+      double lots   = CalcLotSize(PrimaryRisk, 15.0);
+      g_LastLotSize = lots;
+      int    maxEnt = GetMaxEntriesForScore(g_PrimaryScore);
+      return StringFormat("▶ PRIMARY  (H4→H1→M15): %s | Score %d/42 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+                          dir, g_PrimaryScore, PrimaryRisk, lots, openNow, maxEnt);
    }
 
-   // Fallback strategy
+   // Tier 2 — Fallback: H1 → M15 → M5
    if(g_FallbackScore >= effFall) {
-      string dir     = g_H1.bullish ? "BUY" : "SELL";
-      double slPips  = 10.0;
-      double lots    = CalcLotSize(FallbackRisk, slPips);
-      g_LastLotSize  = lots;
-      int    maxEnt  = GetMaxEntriesForScore(g_FallbackScore);
-      int    openNow = CountOpenTrades();
-      string entStr  = StringFormat("%d/%d entries open", openNow, maxEnt);
-      return StringFormat("FALLBACK TRADE: %s | Score %d/42 | Risk %.1f%% | Lots: %.2f | Entries: %s",
-                          dir, g_FallbackScore, FallbackRisk, lots, entStr);
+      string dir    = g_H1.bullish ? "BUY" : "SELL";
+      double lots   = CalcLotSize(FallbackRisk, 10.0);
+      g_LastLotSize = lots;
+      int    maxEnt = GetMaxEntriesForScore(g_FallbackScore);
+      return StringFormat("▶ FALLBACK (H1→M15→M5): %s | Score %d/42 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+                          dir, g_FallbackScore, FallbackRisk, lots, openNow, maxEnt);
    }
 
-   // Show how far each score is from scaled thresholds
+   // Tier 3 — Tertiary scalp: M15 → M5 → M1
+   if(g_TertiaryScore >= effTert) {
+      string dir    = g_M15.bullish ? "BUY" : "SELL";
+      double lots   = CalcLotSize(TertiaryRisk, 7.0);
+      g_LastLotSize = lots;
+      int    maxEnt = GetMaxEntriesForScore(g_TertiaryScore);
+      return StringFormat("▶ SCALP    (M15→M5→M1): %s | Score %d/42 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+                          dir, g_TertiaryScore, TertiaryRisk, lots, openNow, maxEnt);
+   }
+
+   // No tier ready
    string scaleHint = UseScaledEntries ?
-      StringFormat(" | Need %d for 1-entry, %d for 2, %d for 3", ScaledScore1, ScaledScore2, ScaledScore3) : "";
-   return StringFormat("NO TRADE — Primary: %d/42 (need %d) | Fallback: %d/42 (need %d)%s",
-                       g_PrimaryScore, effPrim, g_FallbackScore, effFall, scaleHint);
+      StringFormat("  [Entries: score %d=1, %d=2, %d=3]", ScaledScore1, ScaledScore2, ScaledScore3) : "";
+   return StringFormat("NO TRADE — P:%d/42(≥%d) | F:%d/42(≥%d) | T:%d/42(≥%d)%s",
+                       g_PrimaryScore, effPrim,
+                       g_FallbackScore, effFall,
+                       g_TertiaryScore, effTert, scaleHint);
 }
 
 //+------------------------------------------------------------------+
@@ -2777,6 +2851,7 @@ void GenerateHTMLReport() {
    html += TR("Max Drawdown",       StringFormat("%.2f%%", maxDD));
    html += TR("Primary Trades",     IntegerToString(g_PrimaryTrades));
    html += TR("Fallback Trades",    IntegerToString(g_FallbackTrades));
+   html += TR("Tertiary Trades",    IntegerToString(g_TertiaryTrades));
    html += "</table>";
 
    // Settings used
@@ -2918,6 +2993,27 @@ void UpdateDashboard() {
    SetLabel(PREFIX+"FS", x, y,
             StringFormat("Fallback Score: %d / 42  (Need %d to trade)",
                          g_FallbackScore, MinFallbackScore), fsColor, FontSize);
+   y += dy + 4;
+
+   // ── TERTIARY STRATEGY M15 / M5 / M1 ──
+   SetLabel(PREFIX+"TH", x, y, "── TERTIARY STRATEGY: M15 → M5 → M1  (Scalp — fires when P & F have no signal) ──",
+            ColorHeader, FontSize);
+   y += dy;
+
+   color m1c = g_M1.bullish ? ColorBull : ColorBear;
+   SetLabel(PREFIX+"TM1A", x, y, "M1  STRUCT│", ColorHeader, FontSize);
+   SetLabel(PREFIX+"TM1B", x+95, y, g_M1.structureNarrative, m1c, FontSize);
+   y += dy;
+   SetLabel(PREFIX+"TM1C", x, y, "M1  LIQ   │", ColorHeader, FontSize);
+   SetLabel(PREFIX+"TM1D", x+95, y, g_M1.liquidityNarrative,  m1c, FontSize);
+   y += dy;
+
+   int effTert2 = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
+   color tsColor = (g_TertiaryScore >= effTert2) ? ColorBull :
+                   (g_TertiaryScore >= 8) ? ColorWarn : ColorBear;
+   SetLabel(PREFIX+"TS", x, y,
+            StringFormat("Tertiary Score: %d / 42  (Need %d to trade)  |  Risk: %.1f%%  |  Entry TF: M1",
+                         g_TertiaryScore, effTert2, TertiaryRisk), tsColor, FontSize);
    y += dy + 4;
 
    // ── ADVANCED SMC CHECKLIST ──

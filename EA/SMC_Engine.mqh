@@ -709,4 +709,41 @@ int ScoreFallbackAdvanced(SMCAnalysis &h1, SMCAnalysis &m15, SMCAnalysis &m5) {
    return MathMax(0, score);
 }
 
+//+------------------------------------------------------------------+
+//| Advanced Confluence Score — Tertiary M15/M5/M1 (scalp tier)   |
+//| Same SMC logic, lowest timeframes, smallest risk               |
+//+------------------------------------------------------------------+
+int ScoreTertiaryAdvanced(SMCAnalysis &m15, SMCAnalysis &m5, SMCAnalysis &m1) {
+   int score = 0;
+
+   // M15 acts as the "HTF anchor" (same role H4 plays in primary)
+   if(m15.hasExternalBOS && m15.bullish == m5.bullish)  score += 3;
+   if(m15.hasFreshOB)                                    score += 3;
+   if((m15.bullish && m15.inDiscount) ||
+      (!m15.bullish && m15.inPremium))                   score += 2;
+   if(m15.atKeySR)                                       score += 2;
+   if(m15.hasMSS)                                        score += 3;
+
+   // M5 — zone confirmation (same role H1 plays in primary)
+   if(m5.hasCHoCH && m5.bullish == m15.bullish)          score += 2;
+   if(m5.hasFreshOB && m5.hasLiqSweep)                  score += 3;
+   if(m5.hasFVGOpen)                                     score += 2;
+   if(m5.inOTE)                                          score += 2;
+   if(m5.hasDisplacement)                                score += 1;
+
+   // M1 — entry trigger (same role M15 plays in primary)
+   if(m1.hasLiqSweep)                                    score += 3;
+   if(m1.hasCHoCH || m1.hasMSS)                         score += 3;
+   if(m1.hasFVGOpen)                                     score += 2;
+   if(m1.hasFreshOB)                                     score += 1;
+   if(m1.inSilverBullet)                                 score += 1;
+
+   // Penalties
+   if(m15.hasMitigatedOB && !m15.hasFreshOB)             score -= 3;
+   if(m5.hasFVGClosed    && !m5.hasFVGOpen)              score -= 2;
+   if(m15.bullish != m5.bullish)                          score -= 4; // Conflicting bias
+
+   return MathMax(0, score);
+}
+
 #endif // SMC_ENGINE_MQH
