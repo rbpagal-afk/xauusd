@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.10"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.10"
+#property version     "13.11"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.11"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -118,10 +118,18 @@ input int              CooldownBars      = 3;      // Bars to wait after last tr
 input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time (overridden by scaled entries)
 
 input group            "=== SESSION-SPECIFIC SETTINGS ==="
-// ── Pre-session blackout windows — NO new entries (existing trades managed) ──
-input bool             UsePreSessionBlackout = true;  // Block new entries in pre-London & pre-NY danger zones
-input int              PreLondonBlackoutMins = 90;    // Block this many minutes BEFORE London open (3PM PHT)
-input int              PreNYBlackoutMins     = 30;    // Block this many minutes BEFORE NY open (8PM PHT)
+// ── Pre-London Spike Window (1:30PM-3PM PHT) — Asian range sweep, Judas Swing setups ──
+input bool             TradePreLondon       = true;   // Trade pre-London spike window (1:30-3PM PHT)
+input double           PreLondonRisk        = 1.0;    // Pre-London risk % (reduced — spike volatility)
+input int              PreLondonMinScore    = 10;     // Min score (high bar — Judas confirmation required)
+input int              PreLondonBlackoutMins = 90;    // Window size in minutes before London open (3PM PHT)
+// ── Pre-NY Spike Window (7:30PM-8PM PHT) — London range sweep, Judas Swing setups ──
+input bool             TradePreNY           = true;   // Trade pre-NY spike window (7:30-8PM PHT)
+input double           PreNYRisk            = 1.0;    // Pre-NY risk % (reduced — spike volatility)
+input int              PreNYMinScore        = 10;     // Min score (high bar — Judas + DXY confirmation)
+input int              PreNYBlackoutMins    = 30;     // Window size in minutes before NY open (8PM PHT)
+// ── DEPRECATED: hard blackout toggle (kept for compatibility — use risk/score controls above) ──
+input bool             UsePreSessionBlackout = false; // Hard-block all entries in pre-session windows
 // ── London Open (3PM-5PM PHT) — Judas Sweep reversal + trending ──
 input double           LondonRisk         = 2.0;    // London Open risk % (full — best trending window)
 input int              LondonMinScore     = 7;      // Min score for London Open w/ Judas Swing (no-Judas = +2)
@@ -327,7 +335,7 @@ string     g_CandlePattern     = "None"; // Pattern detected: Engulf / PinBar / 
 //| Adaptive Learning — confluence snapshot at trade entry          |
 //+------------------------------------------------------------------+
 #define CONFLUENCE_COUNT 20
-#define SESSION_COUNT     7
+#define SESSION_COUNT     9
 
 string g_ConfluenceNames[CONFLUENCE_COUNT] = {
    "H4 ExtBOS",  "H4 MSS",       "H4 FreshOB",  "H4 AtSR",
@@ -338,16 +346,19 @@ string g_ConfluenceNames[CONFLUENCE_COUNT] = {
 };
 
 // Session index constants — must match g_SessionNames order
-#define SESS_ASIAN       0
-#define SESS_PREMARKET   1
-#define SESS_LONDON_OPEN 2
-#define SESS_LONDON_MID  3
-#define SESS_NY_OPEN     4
-#define SESS_NY_PM       5
-#define SESS_OTHER       6
+#define SESS_ASIAN        0
+#define SESS_PREMARKET    1
+#define SESS_PRELONDON    2   // Pre-London spike window — Judas Swing setups
+#define SESS_LONDON_OPEN  3
+#define SESS_LONDON_MID   4
+#define SESS_PRENY        5   // Pre-NY spike window — Judas Swing setups
+#define SESS_NY_OPEN      6
+#define SESS_NY_PM        7
+#define SESS_OTHER        8
 
 string g_SessionNames[SESSION_COUNT] = {
-   "Asian KZ", "Pre-Market", "London Open", "London Mid", "NY Open", "NY PM/SB", "Other"
+   "Asian KZ", "Pre-Market", "Pre-London", "London Open", "London Mid",
+   "Pre-NY", "NY Open", "NY PM/SB", "Other"
 };
 
 struct ConfluenceStats {
@@ -1224,9 +1235,9 @@ int GetMaxEntriesForScore(int score) {
 //| Session index from current session string                       |
 //+------------------------------------------------------------------+
 int GetSessionIndex() {
-   // Pre-session blackout windows use dynamic strings (contain countdown) — check with StringFind
-   if(StringFind(g_Session, "Pre-London Blackout") >= 0) return SESS_OTHER; // blocked
-   if(StringFind(g_Session, "Pre-NY Blackout")     >= 0) return SESS_OTHER; // blocked
+   // Pre-session spike windows use dynamic strings (contain countdown) — check with StringFind
+   if(StringFind(g_Session, "Pre-London Spike") >= 0) return SESS_PRELONDON;
+   if(StringFind(g_Session, "Pre-NY Spike")     >= 0) return SESS_PRENY;
    if(g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)")       return SESS_ASIAN;
    if(g_Session == "Pre-Market — Asian Extension (7AM-3PM PHT)")           return SESS_PREMARKET;
    if(g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)")           return SESS_LONDON_OPEN;
@@ -1270,6 +1281,31 @@ SessionParams GetSessionParams() {
          p.tp2RR        = AsianTP2_RR;
          p.tag          = "[PRE-MKT]";
          break;
+      case SESS_PRELONDON: {
+         // Pre-London spike window — Asian range being swept, Judas Swing loading
+         // Big spikes happen here. Trade WITH Judas (reversal) at high confluence only.
+         // Judas required → tight score bar; without Judas → very high bar (avoid fakes)
+         bool hasJudas = g_M15.isJudasSwing || g_M5.isJudasSwing || g_H1.isJudasSwing;
+         p.risk         = PreLondonRisk;
+         p.minScore     = hasJudas ? PreLondonMinScore : PreLondonMinScore + 3;
+         p.maxNewTrades = TradePreLondon ? 1 : 0;
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = LondonTP2_RR;   // Same target as London — delivering into London session
+         p.tag          = hasJudas ? "[PRE-LDN-JUDAS]" : "[PRE-LDN]";
+         break;
+      }
+      case SESS_PRENY: {
+         // Pre-NY spike window — London range sweep, Judas Swing loading
+         // Sharp moves before NY open. Trade reversal at very high confluence only.
+         bool hasJudas = g_M15.isJudasSwing || g_M5.isJudasSwing || g_H1.isJudasSwing;
+         p.risk         = PreNYRisk;
+         p.minScore     = hasJudas ? PreNYMinScore : PreNYMinScore + 3;
+         p.maxNewTrades = TradePreNY ? 1 : 0;
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = NYOpenTP2_RR;   // Same target as NY — delivering into NY open
+         p.tag          = hasJudas ? "[PRE-NY-JUDAS]" : "[PRE-NY]";
+         break;
+      }
       case SESS_LONDON_OPEN: {
          bool hasJudas = g_M15.isJudasSwing || g_M5.isJudasSwing || g_H1.isJudasSwing;
          p.risk         = LondonRisk;
@@ -1338,9 +1374,13 @@ void TryAutoEntry() {
    // Block sessions that are not in a trade window
    bool isAsian     = (curSessIdx == SESS_ASIAN);
    bool isPremarket = (curSessIdx == SESS_PREMARKET);
+   bool isPreLondon = (curSessIdx == SESS_PRELONDON);
+   bool isPreNY     = (curSessIdx == SESS_PRENY);
    bool inSession   = (curSessIdx != SESS_OTHER) &&
                       !(isAsian     && !TradeAsianSession) &&
-                      !(isPremarket && !TradePremarket);
+                      !(isPremarket && !TradePremarket) &&
+                      !(isPreLondon && !TradePreLondon) &&
+                      !(isPreNY     && !TradePreNY);
    if(!inSession || sp.maxNewTrades == 0) { g_AlertSent = false; return; }
 
    // NY PM: block new trades if already at limit
@@ -1440,11 +1480,13 @@ void TryAutoEntry() {
    }
 
    // ── JUDAS SWING DIRECTION OVERRIDE ──
-   // London Open / NY Open: if Judas Sweep detected, the REAL trade is the REVERSAL.
-   // judasSwingBull = swept above Asian high → SELL (isBuy = false)
-   // judasSwingBear = swept below Asian low  → BUY  (isBuy = true)
+   // Pre-session / London Open / NY Open: if Judas Sweep detected, the REAL trade is the REVERSAL.
+   // judasSwingBull = swept above Asian/London high → SELL reversal
+   // judasSwingBear = swept below Asian/London low  → BUY  reversal
    bool judasActive = g_M15.isJudasSwing || g_M5.isJudasSwing;
-   if(judasActive && (curSessIdx == SESS_LONDON_OPEN || curSessIdx == SESS_NY_OPEN)) {
+   bool judasSession = (curSessIdx == SESS_PRELONDON  || curSessIdx == SESS_LONDON_OPEN ||
+                        curSessIdx == SESS_PRENY      || curSessIdx == SESS_NY_OPEN);
+   if(judasActive && judasSession) {
       if(g_M15.judasSwingBull || g_M5.judasSwingBull) {
          isBuy  = false;  // Swept above → sell the reversal
          score += 3;      // Judas Swing is high-probability — reward it
@@ -1453,6 +1495,16 @@ void TryAutoEntry() {
          isBuy  = true;   // Swept below → buy the reversal
          score += 3;
          strategy += "_JUDAS";
+      }
+   }
+   // Pre-session WITHOUT Judas: must have very strong structure to justify entry during spike
+   if((isPreLondon || isPreNY) && !judasActive) {
+      // Require score to exceed the elevated no-Judas threshold — already set by GetSessionParams()
+      // Also require MSS on M15 at minimum (displacement + CHoCH = structure shift confirmed)
+      if(!g_M15.hasMSS && !g_M5.hasMSS) {
+         g_EntryLog = StringFormat("%s no-Judas: MSS required — spike not yet confirmed as reversal",
+                                   sp.tag);
+         return;
       }
    }
 
@@ -1999,38 +2051,41 @@ void AnalyzeAllTimeframes() {
 string GetSession() {
    MqlDateTime dt;
    TimeToStruct(TimeGMT(), dt);
-   int hour = dt.hour;
    int mins = dt.min;
 
    // Convert UTC to PHT (+8) — total minutes since midnight PHT
-   int phtTotalMins = ((hour + 8) % 24) * 60 + mins;
+   int phtTotalMins = ((dt.hour + 8) % 24) * 60 + mins;
    int pht          = phtTotalMins / 60;
 
-   // Pre-session blackout windows (if enabled):
-   //   Pre-London: [3PM PHT - PreLondonBlackoutMins] to 3PM PHT  → no new entries
-   //   Pre-NY:     [8PM PHT - PreNYBlackoutMins]     to 8PM PHT  → no new entries
-   if(UsePreSessionBlackout) {
-      int londonOpenMins = 15 * 60;          // 3PM PHT in minutes
-      int nyOpenMins     = 20 * 60;          // 8PM PHT in minutes
-
-      int preLoStart = londonOpenMins - PreLondonBlackoutMins;
-      int preNyStart = nyOpenMins     - PreNYBlackoutMins;
-
+   // Pre-London spike window: [3PM PHT - PreLondonBlackoutMins] to 3PM PHT
+   // → Asian range being swept, Judas Swing loading up — tradeable with high confluence
+   {
+      int londonOpenMins = 15 * 60;
+      int preLoStart     = londonOpenMins - PreLondonBlackoutMins;
       if(phtTotalMins >= preLoStart && phtTotalMins < londonOpenMins) {
          int minsLeft = londonOpenMins - phtTotalMins;
-         return StringFormat("Pre-London Blackout — Danger Zone (%d min to London)", minsLeft);
+         return StringFormat("Pre-London Spike — Judas Loading (%d min to London)", minsLeft);
       }
+   }
+
+   // Pre-NY spike window: [8PM PHT - PreNYBlackoutMins] to 8PM PHT
+   // → London range sweep, trap retail, Judas loading — tradeable with high confluence
+   {
+      int nyOpenMins = 20 * 60;
+      int preNyStart = nyOpenMins - PreNYBlackoutMins;
       if(phtTotalMins >= preNyStart && phtTotalMins < nyOpenMins) {
          int minsLeft = nyOpenMins - phtTotalMins;
-         return StringFormat("Pre-NY Blackout — Danger Zone (%d min to NY Open)", minsLeft);
+         return StringFormat("Pre-NY Spike — Judas Loading (%d min to NY Open)", minsLeft);
       }
    }
 
    // PHT (UTC+8) session windows for gold trader in Philippines:
    // Asian KZ:    05:00-07:00 PHT (21:00-23:00 UTC)
-   // Pre-market:  07:00-15:00 PHT — rest / prepare
+   // Pre-market:  07:00-13:30 PHT — rest / prepare / Asian extension
+   // Pre-London:  13:30-15:00 PHT — Asian range sweep, Judas spike window
    // London Open: 15:00-17:00 PHT (07:00-09:00 UTC) ← TRADE WINDOW 1
-   // London Sess: 17:00-20:00 PHT (09:00-12:00 UTC) — selective
+   // London Sess: 17:00-19:30 PHT (09:00-11:30 UTC) — selective
+   // Pre-NY:      19:30-20:00 PHT — London range sweep, Judas spike window
    // NY Open:     20:00-23:00 PHT (12:00-15:00 UTC) ← BEST TRADE WINDOW
    // NY PM Close: 23:00-01:00 PHT (15:00-17:00 UTC) — Silver Bullet / wind down
    // NY Closed:   01:00-05:00 PHT — sleep
@@ -2044,14 +2099,12 @@ string GetSession() {
 }
 
 //+------------------------------------------------------------------+
-//| Returns true when EA is in a pre-session blackout window         |
-//| During blackout: no NEW entries; existing trades still managed   |
+//| Returns true for hard blackout (UsePreSessionBlackout override)  |
 //+------------------------------------------------------------------+
 bool IsInPreSessionBlackout() {
    if(!UsePreSessionBlackout) return false;
-   // Match against the dynamic labels produced by GetSession()
-   if(StringFind(g_Session, "Pre-London Blackout") >= 0) return true;
-   if(StringFind(g_Session, "Pre-NY Blackout")     >= 0) return true;
+   if(StringFind(g_Session, "Pre-London Spike") >= 0) return true;
+   if(StringFind(g_Session, "Pre-NY Spike")     >= 0) return true;
    return false;
 }
 
@@ -3468,15 +3521,17 @@ void UpdateDashboard() {
    // Session + active parameters
    int    dsi = GetSessionIndex();
    SessionParams dsp = GetSessionParams();
-   bool   inBlackout = IsInPreSessionBlackout();
+   bool   inBlackout  = IsInPreSessionBlackout();
+   bool   isPreSess   = (dsi == SESS_PRELONDON || dsi == SESS_PRENY);
    color sessionColor = inBlackout                                                                   ? clrOrangeRed :
+                        isPreSess                                                                   ? clrGold :
                         (dsi == SESS_LONDON_OPEN || dsi == SESS_NY_OPEN)                           ? ColorBull :
                         (dsi == SESS_ASIAN || dsi == SESS_PREMARKET ||
                          dsi == SESS_LONDON_MID || dsi == SESS_NY_PM)                             ? ColorWarn :
                         ColorNeutral;
-   string sessionDisplay = inBlackout
-      ? StringFormat("⚠ %s", g_Session)
-      : StringFormat("Session: %s", g_Session);
+   string sessionDisplay = inBlackout  ? StringFormat("⚠ BLOCKED: %s", g_Session) :
+                           isPreSess   ? StringFormat("⚡ %s", g_Session) :
+                                         StringFormat("Session: %s", g_Session);
    SetLabel(PREFIX+"T2", x, y, sessionDisplay, sessionColor, FontSize);
    y += dy;
    string sessParamStr = StringFormat("Risk: %.1f%%  |  Min Score: %d  |  TP2 RR: 1:%.1f  |  Max Entries: %s  |  %s",
