@@ -561,7 +561,7 @@ int OnInit() {
    g_DynPrimaryScore   = MinPrimaryScore;
    g_DynFallbackScore  = MinFallbackScore;
    g_DynTertiaryScore  = MinTertiaryScore;
-   ArrayInitialize(g_Snapshots, 0);
+   ArrayResize(g_Snapshots, 0);
    if(!g_IsTesting) LoadLearningData();
 
    if(!g_IsTesting) InitJournal();
