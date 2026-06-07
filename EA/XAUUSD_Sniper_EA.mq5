@@ -256,6 +256,13 @@ bool       g_UseTertiary    = false;
 datetime   g_LastUpdate     = 0;
 bool       g_SMTDivergence  = false;  // SMT divergence detected (Gold vs DXY)
 string     g_SMTType        = "";     // "BULL" = Gold weak/DXY strong, "BEAR" = Gold strong/DXY weak
+// Daily bias lock — set after London confirms direction, used to filter NY Open trades
+bool       g_DailyBiasLocked = false; // True after London Open confirms direction
+bool       g_DailyBias       = false; // true=bullish, false=bearish (locked after London)
+datetime   g_DailyBiasDate   = 0;     // Date bias was locked (reset each new day)
+// Open trade direction tracking — prevent stacking opposite directions across sessions
+int        g_OpenBuys        = 0;     // Count of currently open BUY trades
+int        g_OpenSells       = 0;     // Count of currently open SELL trades
 
 //--- Capital protection state per ticket
 struct TradeState {
@@ -535,6 +542,10 @@ void ResetDailyTracking() {
    g_MaxTradesHit     = false;
    g_ConsecLossHit    = false;
    g_BlockReason      = "";
+   // Reset daily bias lock — each new day starts fresh
+   g_DailyBiasLocked  = false;
+   g_DailyBias        = false;
+   g_DailyBiasDate    = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -1252,14 +1263,18 @@ SessionParams GetSessionParams() {
          p.tp2RR        = AsianTP2_RR;
          p.tag          = "[PRE-MKT]";
          break;
-      case SESS_LONDON_OPEN:
+      case SESS_LONDON_OPEN: {
+         bool hasJudas = g_M15.isJudasSwing || g_M5.isJudasSwing || g_H1.isJudasSwing;
          p.risk         = LondonRisk;
-         p.minScore     = LondonMinScore;
-         p.maxNewTrades = 99; // scaled entries decide
+         // Judas Swing detected → low score OK (it's the holy grail setup)
+         // No Judas Swing → require higher confluence before trading London trend
+         p.minScore     = hasJudas ? LondonMinScore : LondonMinScore + 2;
+         p.maxNewTrades = 99;
          p.tp1RR        = TP1_RR;
          p.tp2RR        = LondonTP2_RR;
-         p.tag          = "[LONDON-OPEN]";
+         p.tag          = hasJudas ? "[LONDON-JUDAS]" : "[LONDON-OPEN]";
          break;
+      }
       case SESS_LONDON_MID:
          p.risk         = LondonMidRisk;
          p.minScore     = LondonMidMinScore;
@@ -1408,6 +1423,68 @@ void TryAutoEntry() {
       riskPct  = TertiaryRisk;
       strategy = "TERTIARY";
       entryTF  = TF_M1;
+   }
+
+   // ── JUDAS SWING DIRECTION OVERRIDE ──
+   // London Open / NY Open: if Judas Sweep detected, the REAL trade is the REVERSAL.
+   // judasSwingBull = swept above Asian high → SELL (isBuy = false)
+   // judasSwingBear = swept below Asian low  → BUY  (isBuy = true)
+   bool judasActive = g_M15.isJudasSwing || g_M5.isJudasSwing;
+   if(judasActive && (curSessIdx == SESS_LONDON_OPEN || curSessIdx == SESS_NY_OPEN)) {
+      if(g_M15.judasSwingBull || g_M5.judasSwingBull) {
+         isBuy  = false;  // Swept above → sell the reversal
+         score += 3;      // Judas Swing is high-probability — reward it
+         strategy += "_JUDAS";
+      } else if(g_M15.judasSwingBear || g_M5.judasSwingBear) {
+         isBuy  = true;   // Swept below → buy the reversal
+         score += 3;
+         strategy += "_JUDAS";
+      }
+   }
+
+   // ── DAILY BIAS LOCK — set after London Open confirms, gate NY Open ──
+   if(curSessIdx == SESS_LONDON_OPEN && !g_DailyBiasLocked) {
+      // Lock direction only when strong signal fires (H1 + M15 agree)
+      if(g_H1.bullish == g_M15.bullish) {
+         g_DailyBias       = isBuy;
+         g_DailyBiasLocked = true;
+         g_DailyBiasDate   = TimeCurrent();
+      }
+   }
+   // NY Open: if daily bias is locked, only trade in bias direction
+   if(curSessIdx == SESS_NY_OPEN && g_DailyBiasLocked) {
+      if(isBuy != g_DailyBias) {
+         g_EntryLog = StringFormat("NY BIAS FILTER: %s trade blocked — London set %s bias today",
+                                   isBuy ? "BUY" : "SELL",
+                                   g_DailyBias ? "BULLISH" : "BEARISH");
+         return;
+      }
+   }
+
+   // ── CROSS-SESSION DIRECTION CONFLICT PREVENTION ──
+   // Don't stack opposite directions: if SELL trades are open, block BUY (and vice versa)
+   // Exception: allow if current session is high-confidence (score >= ScaledScore2)
+   if(isBuy && g_OpenSells > 0 && score < ScaledScore2) {
+      g_EntryLog = StringFormat("DIRECTION CONFLICT: %d SELL(s) open — need score≥%d to add BUY",
+                                g_OpenSells, ScaledScore2);
+      return;
+   }
+   if(!isBuy && g_OpenBuys > 0 && score < ScaledScore2) {
+      g_EntryLog = StringFormat("DIRECTION CONFLICT: %d BUY(s) open — need score≥%d to add SELL",
+                                g_OpenBuys, ScaledScore2);
+      return;
+   }
+
+   // ── PO3 PHASE SESSION GATE ──
+   // Accumulation phase → Asian/Pre-market only (range fade)
+   // Manipulation phase → London Open only (Judas reversal)
+   // Distribution phase → all sessions (trend follow)
+   if(g_M15.po3Accumulation && curSessIdx != SESS_ASIAN && curSessIdx != SESS_PREMARKET) {
+      // PO3 says we're still in range — don't trend-follow outside Asian
+      if(!g_M15.po3Manipulation && !g_M15.po3Distribution) {
+         g_EntryLog = "PO3 GATE: Accumulation phase — range trade only in Asian/Pre-market";
+         return;
+      }
    }
 
    // ── PER-SESSION RISK & TP OVERRIDES ──
@@ -1630,11 +1707,16 @@ double GetSweepLevel(bool isBuy, ENUM_TIMEFRAMES tf) {
 //+------------------------------------------------------------------+
 int CountOpenTrades() {
    int count = 0;
+   g_OpenBuys  = 0;
+   g_OpenSells = 0;
    for(int i = 0; i < PositionsTotal(); i++) {
-      if(PositionInfo.SelectByIndex(i))
-         if(PositionInfo.Symbol() == _Symbol &&
-            PositionInfo.Magic()  == MagicNumber)
-            count++;
+      if(PositionInfo.SelectByIndex(i) &&
+         PositionInfo.Symbol() == _Symbol &&
+         PositionInfo.Magic()  == MagicNumber) {
+         count++;
+         if(PositionInfo.PositionType() == POSITION_TYPE_BUY)  g_OpenBuys++;
+         else                                                    g_OpenSells++;
+      }
    }
    return count;
 }
@@ -3345,10 +3427,23 @@ void UpdateDashboard() {
    SetLabel(PREFIX+"T2", x, y,
             StringFormat("Session: %s", g_Session), sessionColor, FontSize);
    y += dy;
-   string sessParamStr = StringFormat("Risk: %.1f%%  |  Min Score: %d  |  TP2 RR: 1:%.1f  |  Max New Trades: %s",
+   string sessParamStr = StringFormat("Risk: %.1f%%  |  Min Score: %d  |  TP2 RR: 1:%.1f  |  Max Entries: %s  |  %s",
       dsp.risk, dsp.minScore, dsp.tp2RR,
-      dsp.maxNewTrades >= 99 ? "Scaled" : IntegerToString(dsp.maxNewTrades));
+      dsp.maxNewTrades >= 99 ? "Scaled" : IntegerToString(dsp.maxNewTrades),
+      dsp.tag);
    SetLabel(PREFIX+"T2b", x, y, sessParamStr, sessionColor, FontSize);
+   y += dy;
+
+   // Daily bias lock + open positions direction
+   bool judasNow = g_M15.isJudasSwing || g_M5.isJudasSwing;
+   string biasStr = g_DailyBiasLocked
+      ? StringFormat("Daily Bias: %s (locked by London)  |  Open: %d BUY / %d SELL",
+                     g_DailyBias ? "BULLISH" : "BEARISH", g_OpenBuys, g_OpenSells)
+      : StringFormat("Daily Bias: Not locked yet  |  Open: %d BUY / %d SELL",
+                     g_OpenBuys, g_OpenSells);
+   string judasStr = judasNow ? "  |  JUDAS SWING ACTIVE" : "";
+   color biasClr = g_DailyBiasLocked ? (g_DailyBias ? ColorBull : ColorBear) : ColorNeutral;
+   SetLabel(PREFIX+"T2c", x, y, biasStr + judasStr, biasClr, FontSize);
    y += dy + 4;
 
    // ── PRIMARY STRATEGY H4 / H1 / M15 ──

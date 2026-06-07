@@ -70,7 +70,9 @@ struct SMCAnalysis {
    bool     inOTE;              // Price in Optimal Trade Entry zone (61.8-79%)
    double   oteHigh;
    double   oteLow;
-   bool     isJudasSwing;       // False move at session open
+   bool     isJudasSwing;       // False move at session open (sweep + CHoCH)
+   bool     judasSwingBull;     // Swept ABOVE Asian high → SELL reversal setup
+   bool     judasSwingBear;     // Swept BELOW Asian low  → BUY  reversal setup
    bool     inAsianRange;       // Price still inside Asian session range
    bool     aboveAsianHigh;     // Price broke above Asian range
    bool     belowAsianLow;      // Price broke below Asian range
@@ -542,22 +544,33 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
 
    //================================================================
    // JUDAS SWING — false move at London/NY open then reversal
+   // ICT: London sweeps Asian high or low, then reverses hard.
+   // judasSwingBull = sweep above Asian high + CHoCH down → SELL setup (reverse of sweep)
+   // judasSwingBear = sweep below Asian low  + CHoCH up   → BUY  setup (reverse of sweep)
    //================================================================
-   a.isJudasSwing = false;
+   a.isJudasSwing     = false;
+   a.judasSwingBull   = false; // Sweep ABOVE (bearish reversal — SELL)
+   a.judasSwingBear   = false; // Sweep BELOW (bullish reversal — BUY)
    MqlDateTime dt;
    TimeToStruct(TimeGMT(), dt);
    int phtHour = (dt.hour + 8) % 24;
-   bool atSessionOpen = (phtHour >= 15 && phtHour < 17) || // London open window
-                        (phtHour >= 20 && phtHour < 22);   // NY open window
-   if(atSessionOpen && a.hasLiqSweep && a.hasCHoCH)
-      a.isJudasSwing = true;
+   bool atSessionOpen = (phtHour >= 15 && phtHour < 17) || // London Open 3-5PM PHT
+                        (phtHour >= 20 && phtHour < 23);   // NY Open 8-11PM PHT
+   if(atSessionOpen && a.hasLiqSweep && a.hasCHoCH) {
+      a.isJudasSwing   = true;
+      // If price swept ABOVE the Asian high → bearish reversal expected
+      a.judasSwingBull = a.aboveAsianHigh && !a.bullish; // Swept up, now bearish
+      // If price swept BELOW the Asian low  → bullish reversal expected
+      a.judasSwingBear = a.belowAsianLow  && a.bullish;  // Swept down, now bullish
+   }
 
    //================================================================
-   // SILVER BULLET WINDOWS — 3AM, 10AM, 2PM NY = 15UTC, 22UTC, 2UTC
-   // In PHT (+8): 3AM NY=11PM PHT, 10AM NY=11PM PHT+1h, 2PM NY=3AM PHT
-   // Most active: 10AM NY = 15:00 UTC = 23:00 PHT
+   // SILVER BULLET WINDOWS (ICT):
+   //   10:00-11:00 AM NY = 15:00-16:00 UTC = 23:00-00:00 PHT  ← primary
+   //    2:00- 3:00 PM NY = 19:00-20:00 UTC = 03:00-04:00 PHT  ← but NY PM session ends 1AM PHT
+   // Only the 10AM window falls inside NY PM session (11PM-1AM PHT)
    //================================================================
-   a.inSilverBullet = (phtHour == 23 || phtHour == 3);
+   a.inSilverBullet = (phtHour == 23 || phtHour == 0); // 11PM or midnight PHT
 
    //================================================================
    // REJECTION BLOCK / PROPULSION BLOCK
