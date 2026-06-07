@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.16"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.16"
+#property version     "13.17"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.17"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -169,6 +169,15 @@ input bool             UseScaledEntries  = true;   // Scale max simultaneous tra
 input int              ScaledScore1      = 8;      // Score threshold for 1 entry
 input int              ScaledScore2      = 9;      // Score threshold for 2 simultaneous entries
 input int              ScaledScore3      = 10;     // Score threshold for 3 simultaneous entries
+
+input group            "=== ATR VOLATILITY FILTER ==="
+input bool             UseATRFilter       = true;    // Block entries when market is too choppy or spiking
+input int              ATR_Period         = 14;       // ATR period (H1 bars)
+input double           ATR_ChopThreshold  = 8.0;     // Block if H1 ATR < this many pips (dead chop)
+input double           ATR_SpikeThreshold = 60.0;    // Block if H1 ATR > this many pips (news spike)
+input bool             UseATRStop         = false;   // Use ATR for SL sizing (overrides sweep SL)
+input double           ATR_SLMultiplier   = 1.5;     // SL = ATR * this multiplier (when UseATRStop=true)
+input double           ATR_TPMultiplier   = 3.0;     // TP2 = ATR * this multiplier (when UseATRStop=true)
 
 input group            "=== ICT ADVANCED CONCEPTS ==="
 input bool             UseKillzones      = true;   // Score bonus for London/NY killzones
@@ -464,6 +473,27 @@ int        g_TotalLosses       = 0;
 double     g_TotalProfit       = 0;
 double     g_TotalLoss         = 0;
 string     g_JournalPath       = "";
+
+//--- Extended metrics for Z Report
+int        g_ATRBlockCount     = 0;   // Trades blocked by ATR chop/spike filter
+int        g_NewsBlockCount    = 0;   // Trades blocked by news filter (incremented in TryAutoEntry)
+int        g_SpreadBlockCount  = 0;   // Trades blocked by spread filter
+
+// Per-session extended stats (parallel to g_SessStats[SESSION_COUNT])
+double     g_SessProfit[SESSION_COUNT];    // Gross profit per session
+double     g_SessLoss[SESSION_COUNT];      // Gross loss per session
+double     g_SessPips[SESSION_COUNT];      // Net pips per session
+
+// Monthly performance tracking
+struct MonthlyPerf {
+   int    year;
+   int    month;
+   int    wins;
+   int    losses;
+   double grossProfit;
+   double grossLoss;
+};
+MonthlyPerf g_MonthlyPerf[];   // Dynamically grown as months pass
 
 //--- Visual tracking — avoid redrawing every tick
 datetime   g_LastVisualBar     = 0;
@@ -1402,6 +1432,29 @@ void TryAutoEntry() {
       }
    }
 
+   // ATR volatility filter — block entries during dead chop and news spike blow-offs
+   if(UseATRFilter) {
+      double pip  = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+      int atrHnd  = iATR(_Symbol, TF_H1, ATR_Period);
+      double atrBuf[];
+      ArraySetAsSeries(atrBuf, true);
+      if(atrHnd != INVALID_HANDLE && CopyBuffer(atrHnd, 0, 1, 1, atrBuf) == 1) {
+         double atrPips = atrBuf[0] / pip;
+         if(atrPips < ATR_ChopThreshold) {
+            g_EntryLog = StringFormat("ATR CHOP FILTER: H1 ATR=%.1f pips < %.1f minimum — market too quiet, skip",
+                                      atrPips, ATR_ChopThreshold);
+            g_ATRBlockCount++;
+            return;
+         }
+         if(atrPips > ATR_SpikeThreshold) {
+            g_EntryLog = StringFormat("ATR SPIKE FILTER: H1 ATR=%.1f pips > %.1f maximum — news spike, skip",
+                                      atrPips, ATR_SpikeThreshold);
+            g_ATRBlockCount++;
+            return;
+         }
+      }
+   }
+
    // Load per-session parameters
    SessionParams sp = GetSessionParams();
    int curSessIdx   = GetSessionIndex();
@@ -1829,13 +1882,26 @@ void TryAutoEntry() {
    // Avoid re-alerting same signal — but DO re-alert if direction flipped
    if(g_AlertSent && score == g_LastSignalScore && isBuy == g_LastSignalIsBuy) return;
 
-   // Calculate SL from recent sweep wick — minimum 25 pips for gold's volatility
+   // Calculate SL — either ATR-based or sweep-wick based
    double pip    = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
-   double slRef  = GetSweepLevel(isBuy, entryTF);
-   double slPips = MathAbs((isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                                  : SymbolInfoDouble(_Symbol, SYMBOL_BID)) - slRef)
-                   / pip + SL_BufferPips;
-   slPips = MathMax(slPips, 25.0); // Gold minimum SL: 25 pips ($2.50) — 10 was dangerously small
+   double slPips;
+   if(UseATRStop) {
+      int atrHnd2 = iATR(_Symbol, TF_H1, ATR_Period);
+      double atrBuf2[];
+      ArraySetAsSeries(atrBuf2, true);
+      double atrPips2 = 30.0; // safe fallback
+      if(atrHnd2 != INVALID_HANDLE && CopyBuffer(atrHnd2, 0, 1, 1, atrBuf2) == 1)
+         atrPips2 = atrBuf2[0] / pip;
+      slPips = MathMax(atrPips2 * ATR_SLMultiplier, 25.0);
+      // Override TP2 with ATR multiple when ATR stop mode active
+      effectiveTP2_RR = ATR_TPMultiplier / ATR_SLMultiplier; // express as RR ratio
+   } else {
+      double slRef  = GetSweepLevel(isBuy, entryTF);
+      slPips = MathAbs((isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                               : SymbolInfoDouble(_Symbol, SYMBOL_BID)) - slRef)
+                / pip + SL_BufferPips;
+      slPips = MathMax(slPips, 25.0); // Gold minimum SL: 25 pips ($2.50)
+   }
 
    // Check minimum RR — sessions with tight custom TP targets bypass the global MinRR
    double tp2Pips = slPips * effectiveTP2_RR;
@@ -3488,6 +3554,40 @@ void JournalWriteTrade(ulong ticket, string strategy, int score,
    g_TotalTrades++;
    if(profitUSD >= 0) { g_TotalWins++;   g_TotalProfit += profitUSD; }
    else               { g_TotalLosses++; g_TotalLoss   += MathAbs(profitUSD); }
+
+   // Per-session extended stats
+   int si = GetSessionIndex();
+   if(si >= 0 && si < SESSION_COUNT) {
+      if(profitUSD >= 0) g_SessProfit[si] += profitUSD;
+      else               g_SessLoss[si]   += MathAbs(profitUSD);
+      g_SessPips[si] += profitUSD >= 0 ? rrAchieved * slPips : -(rrAchieved * slPips);
+   }
+
+   // Monthly performance tracking
+   {
+      int n = ArraySize(g_MonthlyPerf);
+      int found = -1;
+      for(int mi = 0; mi < n; mi++) {
+         if(g_MonthlyPerf[mi].year == dt.year && g_MonthlyPerf[mi].month == dt.mon) {
+            found = mi; break;
+         }
+      }
+      if(found < 0) {
+         ArrayResize(g_MonthlyPerf, n + 1);
+         g_MonthlyPerf[n].year  = dt.year;
+         g_MonthlyPerf[n].month = dt.mon;
+         g_MonthlyPerf[n].wins = g_MonthlyPerf[n].losses = 0;
+         g_MonthlyPerf[n].grossProfit = g_MonthlyPerf[n].grossLoss = 0;
+         found = n;
+      }
+      if(profitUSD >= 0) {
+         g_MonthlyPerf[found].wins++;
+         g_MonthlyPerf[found].grossProfit += profitUSD;
+      } else {
+         g_MonthlyPerf[found].losses++;
+         g_MonthlyPerf[found].grossLoss += MathAbs(profitUSD);
+      }
+   }
 }
 
 double GetProfitFactor() {
@@ -3496,6 +3596,14 @@ double GetProfitFactor() {
 
 double GetWinRate() {
    return g_TotalTrades > 0 ? (double)g_TotalWins / g_TotalTrades * 100.0 : 0;
+}
+
+double GetExpectedPayoff() {
+   if(g_TotalTrades == 0) return 0;
+   double avgWin  = g_TotalWins   > 0 ? g_TotalProfit / g_TotalWins   : 0;
+   double avgLoss = g_TotalLosses > 0 ? g_TotalLoss   / g_TotalLosses : 0;
+   double wr      = (double)g_TotalWins / g_TotalTrades;
+   return wr * avgWin - (1.0 - wr) * avgLoss;
 }
 
 //+------------------------------------------------------------------+
@@ -3841,6 +3949,62 @@ void GenerateHTMLReport() {
    html += TR("Primary Trades",     IntegerToString(g_PrimaryTrades));
    html += TR("Fallback Trades",    IntegerToString(g_FallbackTrades));
    html += TR("Tertiary Trades",    IntegerToString(g_TertiaryTrades));
+   html += TR("Expected Payoff",    StringFormat("$%.2f / trade", GetExpectedPayoff()));
+   html += TR("ATR Blocks",         IntegerToString(g_ATRBlockCount));
+   html += TR("Spread Blocks",      IntegerToString(g_SpreadBlockCount));
+   html += TR("News Blocks",        IntegerToString(g_NewsBlockCount));
+   html += "</table>";
+
+   // Per-session breakdown
+   html += "<h2>Per-Session Performance</h2>";
+   html += "<table><tr><th>Session</th><th>Trades</th><th>Wins</th><th>Losses</th>";
+   html += "<th>Win Rate</th><th>Gross Profit</th><th>Gross Loss</th><th>Net P&L</th><th>Pips</th><th>Status</th></tr>";
+   for(int si = 0; si < SESSION_COUNT; si++) {
+      int strades = g_SessStats[si].wins + (g_SessStats[si].total - g_SessStats[si].wins);
+      int swins   = g_SessStats[si].wins;
+      int stotal  = g_SessStats[si].total;
+      int slosses = stotal - swins;
+      double swr  = stotal > 0 ? (double)swins / stotal * 100.0 : 0;
+      double snet = g_SessProfit[si] - g_SessLoss[si];
+      string sc   = swr >= 55.0 ? "win" : (swr >= 40.0 ? "warn" : (stotal > 0 ? "loss" : ""));
+      string susp = g_SessStats[si].suspended ? "<span class='loss'>SUSPENDED</span>" : "<span class='win'>Active</span>";
+      html += StringFormat(
+         "<tr><td>%s</td><td>%d</td><td class='win'>%d</td><td class='loss'>%d</td>"
+         "<td class='%s'>%.1f%%</td><td class='win'>$%.2f</td><td class='loss'>$%.2f</td>"
+         "<td class='%s'>$%.2f</td><td>%.1f</td><td>%s</td></tr>",
+         g_SessionNames[si], stotal, swins, slosses,
+         sc, swr, g_SessProfit[si], g_SessLoss[si],
+         snet >= 0 ? "win" : "loss", snet, g_SessPips[si], susp);
+   }
+   html += "</table>";
+
+   // Monthly performance calendar
+   html += "<h2>Monthly Performance</h2>";
+   html += "<table><tr><th>Year</th><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th>";
+   html += "<th>Win Rate</th><th>Gross Profit</th><th>Gross Loss</th><th>Net P&L</th><th>Profit Factor</th></tr>";
+   double cumPnL = 0;
+   for(int mi = 0; mi < ArraySize(g_MonthlyPerf); mi++) {
+      MonthlyPerf mp = g_MonthlyPerf[mi];
+      int mTrades    = mp.wins + mp.losses;
+      double mWR     = mTrades > 0 ? (double)mp.wins / mTrades * 100.0 : 0;
+      double mNet    = mp.grossProfit - mp.grossLoss;
+      double mPF     = mp.grossLoss > 0 ? mp.grossProfit / mp.grossLoss : (mp.grossProfit > 0 ? 99.0 : 0);
+      cumPnL        += mNet;
+      string mClass  = mNet >= 0 ? "win" : "loss";
+      string mNames[] = {"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+      string monName  = (mp.month >= 1 && mp.month <= 12) ? mNames[mp.month] : IntegerToString(mp.month);
+      html += StringFormat(
+         "<tr><td>%d</td><td>%s</td><td>%d</td><td class='win'>%d</td><td class='loss'>%d</td>"
+         "<td class='%s'>%.1f%%</td><td class='win'>$%.2f</td><td class='loss'>$%.2f</td>"
+         "<td class='%s'>$%.2f</td><td class='%s'>%.2f</td></tr>",
+         mp.year, monName, mTrades, mp.wins, mp.losses,
+         mNet >= 0 ? "win" : "loss", mWR,
+         mp.grossProfit, mp.grossLoss,
+         mClass, mNet, mPF >= 1.0 ? "win" : "loss", mPF);
+   }
+   html += StringFormat("<tr style='font-weight:bold'><td colspan='8'>Cumulative Net P&L</td>"
+                        "<td class='%s'>$%.2f</td><td></td></tr>",
+                        cumPnL >= 0 ? "win" : "loss", cumPnL);
    html += "</table>";
 
    // Settings used
@@ -3862,7 +4026,7 @@ void GenerateHTMLReport() {
    html += TR("Max Spread Pips",      StringFormat("%.1f",   MaxSpreadPips));
    html += "</table>";
 
-   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v13.6 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
+   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v13.17 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
    html += "</body></html>";
 
    FileWriteString(fh, html);
