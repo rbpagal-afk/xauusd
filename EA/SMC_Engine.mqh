@@ -21,8 +21,8 @@ int SMC_DaysInMonth(int year, int month) {
 // Day-of-month for the Nth Sunday in year/month.  nth=1 → first, nth=-1 → last.
 int SMC_NthSundayDay(int year, int month, int nth) {
    MqlDateTime d;
-   ZeroMemory(d);
    d.year = year; d.mon = month; d.day = 1;
+   d.hour = 0;   d.min = 0;    d.sec = 0;
    TimeToStruct(StructToTime(d), d);
    int firstSun = (d.day_of_week == 0) ? 1 : 8 - d.day_of_week;
    if(nth > 0) return firstSun + (nth - 1) * 7;
