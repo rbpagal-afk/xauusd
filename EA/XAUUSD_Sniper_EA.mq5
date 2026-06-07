@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.14"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.14"
+#property version     "13.15"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.15"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -269,9 +269,13 @@ datetime   g_LastUpdate     = 0;
 bool       g_SMTDivergence  = false;  // SMT divergence detected (Gold vs DXY)
 string     g_SMTType        = "";     // "BULL" = Gold weak/DXY strong, "BEAR" = Gold strong/DXY weak
 // Daily bias lock — set after London confirms direction, used to filter NY Open trades
-bool       g_DailyBiasLocked = false; // True after London Open confirms direction
-bool       g_DailyBias       = false; // true=bullish, false=bearish (locked after London)
-datetime   g_DailyBiasDate   = 0;     // Date bias was locked (reset each new day)
+bool       g_DailyBiasLocked    = false;
+bool       g_DailyBias          = false; // true=bullish, false=bearish
+datetime   g_DailyBiasDate      = 0;
+// London session range — tracked for NY Judas detection (NY sweeps LONDON range, not Asian)
+double     g_LondonSessionHigh  = 0;    // High formed during London Open + Mid session
+double     g_LondonSessionLow   = 0;    // Low formed during London Open + Mid session
+datetime   g_LondonRangeDate    = 0;    // Date London range was last captured
 // Open trade direction tracking — prevent stacking opposite directions across sessions
 int        g_OpenBuys        = 0;     // Count of currently open BUY trades
 int        g_OpenSells       = 0;     // Count of currently open SELL trades
@@ -1492,17 +1496,105 @@ void TryAutoEntry() {
       entryTF  = TF_M1;
    }
 
+   // ── SESSION-SPECIFIC TIER RULES ──
+   // Asian KZ: H4 trend is irrelevant during range consolidation — PRIMARY tier blocked.
+   // Asian/Premarket must be at Asian range extreme (within 20 pips of High/Low), not mid-range.
+   if(isAsian) {
+      if(primaryReady) {
+         primaryReady  = false;
+         fallbackReady = (g_FallbackScore >= effectiveFallScore);
+         tertiaryReady = !fallbackReady && (g_TertiaryScore >= effectiveTertScore);
+         if(fallbackReady) {
+            isBuy    = g_H1.bullish;
+            score    = g_FallbackScore;
+            riskPct  = FallbackRisk;
+            strategy = "FALLBACK";
+            entryTF  = TF_M5;
+         } else if(tertiaryReady) {
+            isBuy    = g_M15.bullish;
+            score    = g_TertiaryScore;
+            riskPct  = TertiaryRisk;
+            strategy = "TERTIARY";
+            entryTF  = TF_M1;
+         } else {
+            g_EntryLog = "ASIAN: PRIMARY blocked (range session — H4 bias irrelevant), no fallback tier";
+            return;
+         }
+      }
+      // Must be at Asian range extreme — no mid-range entries
+      double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+      bool atAsianExtreme =
+         ( isBuy && g_M15.asianLow  > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_BID) - g_M15.asianLow)  < pip * 20) ||
+         (!isBuy && g_M15.asianHigh > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_ASK) - g_M15.asianHigh) < pip * 20);
+      if(!atAsianExtreme) {
+         g_EntryLog = StringFormat("ASIAN: Mid-range — price must reach Asian %s (%.2f) within 20 pips",
+                                   isBuy ? "Low" : "High",
+                                   isBuy ? g_M15.asianLow : g_M15.asianHigh);
+         return;
+      }
+   }
+
+   // NY PM: wind-down session — PRIMARY tier blocked entirely (only scalp tiers allowed).
+   // Silver Bullet window is already gated above; this enforces the tier cap.
+   if(curSessIdx == SESS_NY_PM && primaryReady) {
+      primaryReady  = false;
+      fallbackReady = (g_FallbackScore >= effectiveFallScore);
+      tertiaryReady = !fallbackReady && (g_TertiaryScore >= effectiveTertScore);
+      if(fallbackReady) {
+         isBuy    = g_H1.bullish;
+         score    = g_FallbackScore;
+         riskPct  = FallbackRisk;
+         strategy = "FALLBACK";
+         entryTF  = TF_M5;
+      } else if(tertiaryReady) {
+         isBuy    = g_M15.bullish;
+         score    = g_TertiaryScore;
+         riskPct  = TertiaryRisk;
+         strategy = "TERTIARY";
+         entryTF  = TF_M1;
+      } else {
+         g_EntryLog = "NY PM: PRIMARY blocked (wind-down — scalp tiers only outside SB window), no fallback tier";
+         return;
+      }
+   }
+
    // ── JUDAS SWING DIRECTION OVERRIDE ──
    // Pre-session / London Open / NY Open: if Judas Sweep detected, the REAL trade is the REVERSAL.
-   // judasSwingBull = swept above Asian/London high → SELL reversal
-   // judasSwingBear = swept below Asian/London low  → BUY  reversal
+   // London sessions: judasSwingBull/Bear uses Asian range (correct — London sweeps Asia).
+   // NY sessions: check LONDON session range instead — NY sweeps the London range.
    bool judasActive = g_M15.isJudasSwing || g_M5.isJudasSwing;
    bool judasSession = (curSessIdx == SESS_PRELONDON  || curSessIdx == SESS_LONDON_OPEN ||
                         curSessIdx == SESS_PRENY      || curSessIdx == SESS_NY_OPEN);
-   if(judasActive && judasSession) {
+
+   // NY-specific: override Judas direction using London session range (not Asian range)
+   bool nyLondonJudasBull = false; // swept above London high → SELL
+   bool nyLondonJudasBear = false; // swept below London low  → BUY
+   if((curSessIdx == SESS_PRENY || curSessIdx == SESS_NY_OPEN) &&
+       g_LondonSessionHigh > 0 && g_LondonSessionLow > 0) {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      // Swept above London high: wick above + close (bid) back below = NY sells the false break
+      nyLondonJudasBull = (ask > g_LondonSessionHigh && bid < g_LondonSessionHigh && g_M15.hasCHoCH);
+      // Swept below London low: wick below + close (ask) back above = NY buys the false break
+      nyLondonJudasBear = (bid < g_LondonSessionLow  && ask > g_LondonSessionLow  && g_M15.hasCHoCH);
+      if(nyLondonJudasBull || nyLondonJudasBear) {
+         judasActive = true; // treat as Judas for downstream gates
+         if(nyLondonJudasBull) {
+            isBuy  = false;
+            score += 4; // NY London Judas = very high probability (full day manipulation)
+            strategy += "_JUDAS_LDN";
+         } else {
+            isBuy  = true;
+            score += 4;
+            strategy += "_JUDAS_LDN";
+         }
+      }
+   }
+
+   if(judasActive && judasSession && !nyLondonJudasBull && !nyLondonJudasBear) {
       if(g_M15.judasSwingBull || g_M5.judasSwingBull) {
          isBuy  = false;  // Swept above → sell the reversal
-         score += 3;      // Judas Swing is high-probability — reward it
+         score += 3;
          strategy += "_JUDAS";
       } else if(g_M15.judasSwingBear || g_M5.judasSwingBear) {
          isBuy  = true;   // Swept below → buy the reversal
@@ -1510,12 +1602,23 @@ void TryAutoEntry() {
          strategy += "_JUDAS";
       }
    }
-   // Pre-session WITHOUT Judas: must have very strong structure to justify entry during spike
-   if((isPreLondon || isPreNY) && !judasActive) {
-      // Require score to exceed the elevated no-Judas threshold — already set by GetSessionParams()
-      // Also require MSS on M15 at minimum (displacement + CHoCH = structure shift confirmed)
-      if(!g_M15.hasMSS && !g_M5.hasMSS) {
-         g_EntryLog = StringFormat("%s no-Judas: MSS required — spike not yet confirmed as reversal",
+
+   // ── PRE-LONDON / PRE-NY SWEEP GATE ──
+   // These windows exist purely for Judas Swing setups and key liquidity sweep reversals.
+   // Any random spike without sweep confirmation = not tradeable.
+   if(isPreLondon || isPreNY) {
+      bool hasSweepSetup = judasActive ||
+                           g_H1.sweepPDH || g_H1.sweepPDL ||
+                           g_H4.sweepPWH || g_H4.sweepPWL ||
+                           g_M15.sweepPDH || g_M15.sweepPDL;
+      if(!hasSweepSetup) {
+         g_EntryLog = StringFormat("%s: No Judas Swing or PDH/PDL sweep — random spike, not tradeable",
+                                   sp.tag);
+         return;
+      }
+      // Without Judas: also require MSS for structure confirmation (sweep alone = not enough)
+      if(!judasActive && !g_M15.hasMSS && !g_M5.hasMSS) {
+         g_EntryLog = StringFormat("%s PDH/PDL-only: MSS required on M15/M5 — sweep not yet confirmed",
                                    sp.tag);
          return;
       }
@@ -1561,6 +1664,22 @@ void TryAutoEntry() {
          g_EntryLog = StringFormat("NY BIAS FILTER: %s trade blocked — London set %s bias today",
                                    isBuy ? "BUY" : "SELL",
                                    g_DailyBias ? "BULLISH" : "BEARISH");
+         return;
+      }
+   }
+
+   // London Mid: continuation of London Open move only — counter-trend always blocked.
+   // London Mid is distribution/extension phase; reversal entries here are low-probability traps.
+   if(curSessIdx == SESS_LONDON_MID) {
+      if(g_DailyBiasLocked && isBuy != g_DailyBias) {
+         g_EntryLog = StringFormat("LONDON MID: Counter-trend %s blocked — London Open set %s bias (continuation only)",
+                                   isBuy ? "BUY" : "SELL",
+                                   g_DailyBias ? "BULLISH" : "BEARISH");
+         return;
+      }
+      // Even without bias lock, require H4+H1 agreement — no lone M15 signals in London Mid
+      if(!g_DailyBiasLocked && g_H4.bullish != g_H1.bullish) {
+         g_EntryLog = "LONDON MID: H4/H1 conflict — need higher-TF alignment for continuation entry";
          return;
       }
    }
@@ -2096,7 +2215,31 @@ void AnalyzeAllTimeframes() {
    if(UseSMTDivergence) CheckSMTDivergence();
    else { g_SMTDivergence = false; g_SMTType = ""; }
 
-   g_Session        = GetSession();
+   g_Session = GetSession();
+
+   // Track London session range — used for NY Judas detection.
+   // NY Judas sweeps the LONDON range (not Asian), so we need London H/L.
+   // Capture and extend during London Open + London Mid, freeze once NY opens.
+   {
+      int curIdx = GetSessionIndex();
+      bool inLondon = (curIdx == SESS_LONDON_OPEN || curIdx == SESS_LONDON_MID);
+      MqlDateTime nowDt; TimeToStruct(TimeGMT(), nowDt);
+      datetime today = StringToTime(StringFormat("%04d.%02d.%02d 00:00",
+                                                  nowDt.year, nowDt.mon, nowDt.day));
+      if(g_LondonRangeDate != today) {
+         // New day — reset London range
+         g_LondonSessionHigh = 0;
+         g_LondonSessionLow  = 0;
+         g_LondonRangeDate   = today;
+      }
+      if(inLondon) {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double mid = (ask + bid) / 2.0;
+         if(g_LondonSessionHigh == 0 || mid > g_LondonSessionHigh) g_LondonSessionHigh = mid;
+         if(g_LondonSessionLow  == 0 || mid < g_LondonSessionLow)  g_LondonSessionLow  = mid;
+      }
+   }
 
    int effPrim = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
    int effFall = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
