@@ -3904,7 +3904,7 @@ void GenerateHTMLReport() {
    html += "</style></head><body>";
 
    // Header
-   html += StringFormat("<h1>XAUUSD Sniper EA — Performance Report</h1>");
+   html += "<h1>XAUUSD Sniper EA — Performance Report</h1>";
    html += StringFormat("<p>Generated: %s &nbsp;|&nbsp; Symbol: %s &nbsp;|&nbsp; Magic: %d</p>",
                         TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES), _Symbol, MagicNumber);
    html += StringFormat("<p>Period: %s → %s</p>",
