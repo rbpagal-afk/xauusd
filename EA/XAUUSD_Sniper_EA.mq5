@@ -1498,14 +1498,24 @@ void OnTimer() {
 }
 
 //+------------------------------------------------------------------+
-//| Chart event — redraw if chart changes                           |
+//| Chart event — redraw everything when user switches timeframe    |
 //+------------------------------------------------------------------+
 void OnChartEvent(const int id, const long &lparam,
                   const double &dparam, const string &sparam) {
    if(id == CHARTEVENT_CHART_CHANGE) {
+      // Force full redraw of visuals on next tick
+      g_LastVisualBar = 0;
+
+      // Rebuild dashboard for new TF
       DeleteDashboard();
       CreateDashboard();
       UpdateDashboard();
+
+      // Redraw chart objects immediately
+      ObjectsDeleteAll(0, "VIS_");
+      if(!g_IsTesting) DrawChartVisuals();
+
+      ChartRedraw(0);
    }
 }
 
@@ -2528,7 +2538,10 @@ double GetWinRate() {
 //+------------------------------------------------------------------+
 
 void DrawChartVisuals() {
-   // Clear old visual objects
+   // Skip if analysis data not ready (e.g. immediately after TF switch)
+   if(g_H4.narrative == "" || StringFind(g_H4.narrative, "Loading") >= 0 ||
+      StringFind(g_H4.narrative, "Waiting") >= 0) return;
+
    ObjectsDeleteAll(0, "VIS_");
 
    if(ShowOB)      DrawOrderBlocks();
@@ -2559,8 +2572,14 @@ void DrawOrderBlocks() {
 
 void DrawBox(string name, ENUM_TIMEFRAMES tf, double hi, double lo,
              color clr, string label) {
-   datetime t1 = iTime(_Symbol, tf, OB_Lookback);
-   datetime t2 = iTime(_Symbol, tf, 0) + PeriodSeconds(tf) * 20;
+   if(hi <= 0 || lo <= 0 || hi <= lo) return;
+
+   int      lb = MathMin(OB_Lookback, iBars(_Symbol, tf) - 2);
+   if(lb    < 1) return;
+   datetime t1 = iTime(_Symbol, tf, lb);
+   datetime t2 = iTime(_Symbol, tf, 0);
+   if(t1    <= 0 || t2 <= 0) return;
+   t2 += (datetime)PeriodSeconds(tf) * 20;
 
    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
    ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, hi, t2, lo);
@@ -2583,6 +2602,8 @@ void DrawFVGZones() {
 void DrawFVGForTF(ENUM_TIMEFRAMES tf, string name,
                   SMCAnalysis &a, string label) {
    if(!a.hasFVGOpen) return;
+   if(a.fvgHigh <= 0 || a.fvgLow <= 0) return;
+   if(iBars(_Symbol, tf) < 10) return;
 
    double high[], low[];
    ArraySetAsSeries(high, true);
@@ -2601,9 +2622,11 @@ void DrawFVGForTF(ENUM_TIMEFRAMES tf, string name,
          fvgHi = low[i+1];
          fvgLo = high[i-1];
       }
-      if(fvgHi > 0 && fvgLo > 0) {
+      if(fvgHi > 0 && fvgLo > 0 && fvgHi > fvgLo) {
          datetime t1 = iTime(_Symbol, tf, i + 1);
-         datetime t2 = iTime(_Symbol, tf, 0) + PeriodSeconds(tf) * 15;
+         datetime t2 = iTime(_Symbol, tf, 0);
+         if(t1 <= 0 || t2 <= 0) break;
+         t2 += (datetime)PeriodSeconds(tf) * 15;
          if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
          ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, fvgHi, t2, fvgLo);
          color clr = a.bullish ? ColorFVG_Bull : ColorFVG_Bear;
@@ -2626,22 +2649,18 @@ void DrawSweepLines() {
 void DrawSweepForTF(ENUM_TIMEFRAMES tf, string name,
                     SMCAnalysis &a, string label) {
    if(!a.hasLiqSweep) return;
+   if(a.sweepLevel <= 0) return;
+   if(iBars(_Symbol, tf) < 10) return;
+
    double arr[];
    ArraySetAsSeries(arr, true);
    int lookback = MathMin(Sweep_Lookback + 2, 20);
-   double level = 0;
-
-   if(a.bullish) {
-      if(CopyLow(_Symbol, tf, 1, lookback, arr) < lookback) return;
-      level = arr[ArrayMinimum(arr, 0, lookback)];
-   } else {
-      if(CopyHigh(_Symbol, tf, 1, lookback, arr) < lookback) return;
-      level = arr[ArrayMaximum(arr, 0, lookback)];
-   }
-   if(level <= 0) return;
+   double level = a.sweepLevel;  // Use pre-computed sweep level from SMC engine
 
    datetime t1 = iTime(_Symbol, tf, lookback);
-   datetime t2 = iTime(_Symbol, tf, 0) + PeriodSeconds(tf) * 10;
+   datetime t2 = iTime(_Symbol, tf, 0);
+   if(t1 <= 0 || t2 <= 0) return;
+   t2 += (datetime)PeriodSeconds(tf) * 10;
    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
    ObjectCreate(0, name, OBJ_TREND, 0, t1, level, t2, level);
    ObjectSetInteger(0, name, OBJPROP_COLOR,      ColorSweep);
@@ -2654,61 +2673,66 @@ void DrawSweepForTF(ENUM_TIMEFRAMES tf, string name,
 
 void DrawStructureArrows() {
    // BOS arrows on H4
-   if(ShowBOSArrows && g_H4.hasExternalBOS) {
-      string name = "VIS_BOS_H4";
-      if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
-      ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_H4, 1),
-                   g_H4.bullish ? iLow(_Symbol, TF_H4, 1) - 200 * _Point
-                                : iHigh(_Symbol, TF_H4, 1) + 200 * _Point);
-      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_H4.bullish ? 233 : 234);
-      ObjectSetInteger(0, name, OBJPROP_COLOR,     g_H4.bullish ? ColorBull : ColorBear);
-      ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
-      ObjectSetString (0, name, OBJPROP_TEXT,       "BOS H4");
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   if(ShowBOSArrows && g_H4.hasExternalBOS && iBars(_Symbol, TF_H4) > 2) {
+      datetime  t  = iTime(_Symbol, TF_H4, 1);
+      double    lv = g_H4.bullish ? iLow (_Symbol, TF_H4, 1) - 200 * _Point
+                                  : iHigh(_Symbol, TF_H4, 1) + 200 * _Point;
+      if(t > 0 && lv > 0) {
+         string name = "VIS_BOS_H4";
+         if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+         ObjectCreate(0, name, OBJ_ARROW, 0, t, lv);
+         ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_H4.bullish ? 233 : 234);
+         ObjectSetInteger(0, name, OBJPROP_COLOR,     g_H4.bullish ? ColorBull : ColorBear);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
+         ObjectSetString (0, name, OBJPROP_TEXT,       "BOS H4");
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
    }
    // CHoCH arrows on H1
-   if(ShowCHoCHArrows && g_H1.hasCHoCH) {
-      string name = "VIS_CHOCH_H1";
-      if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
-      ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_H1, 1),
-                   g_H1.bullish ? iLow(_Symbol, TF_H1, 1) - 150 * _Point
-                                : iHigh(_Symbol, TF_H1, 1) + 150 * _Point);
-      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_H1.bullish ? 233 : 234);
-      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrAqua);
-      ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
-      ObjectSetString (0, name, OBJPROP_TEXT,       "CHoCH H1");
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   if(ShowCHoCHArrows && g_H1.hasCHoCH && iBars(_Symbol, TF_H1) > 2) {
+      datetime  t  = iTime(_Symbol, TF_H1, 1);
+      double    lv = g_H1.bullish ? iLow (_Symbol, TF_H1, 1) - 150 * _Point
+                                  : iHigh(_Symbol, TF_H1, 1) + 150 * _Point;
+      if(t > 0 && lv > 0) {
+         string name = "VIS_CHOCH_H1";
+         if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+         ObjectCreate(0, name, OBJ_ARROW, 0, t, lv);
+         ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_H1.bullish ? 233 : 234);
+         ObjectSetInteger(0, name, OBJPROP_COLOR,     clrAqua);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
+         ObjectSetString (0, name, OBJPROP_TEXT,       "CHoCH H1");
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
    }
    // CHoCH on M15
-   if(ShowCHoCHArrows && g_M15.hasCHoCH) {
-      string name = "VIS_CHOCH_M15";
-      if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
-      ObjectCreate(0, name, OBJ_ARROW, 0, iTime(_Symbol, TF_M15, 1),
-                   g_M15.bullish ? iLow(_Symbol, TF_M15, 1) - 100 * _Point
-                                 : iHigh(_Symbol, TF_M15, 1) + 100 * _Point);
-      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_M15.bullish ? 233 : 234);
-      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrYellow);
-      ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
-      ObjectSetString (0, name, OBJPROP_TEXT,       "CHoCH M15");
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   if(ShowCHoCHArrows && g_M15.hasCHoCH && iBars(_Symbol, TF_M15) > 2) {
+      datetime  t  = iTime(_Symbol, TF_M15, 1);
+      double    lv = g_M15.bullish ? iLow (_Symbol, TF_M15, 1) - 100 * _Point
+                                   : iHigh(_Symbol, TF_M15, 1) + 100 * _Point;
+      if(t > 0 && lv > 0) {
+         string name = "VIS_CHOCH_M15";
+         if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+         ObjectCreate(0, name, OBJ_ARROW, 0, t, lv);
+         ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_M15.bullish ? 233 : 234);
+         ObjectSetInteger(0, name, OBJPROP_COLOR,     clrYellow);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
+         ObjectSetString (0, name, OBJPROP_TEXT,       "CHoCH M15");
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
    }
 }
 
 void DrawTradeLevelLines() {
    if(!ShowTradeLevels) return;
-   // Remove old trade lines first
    ObjectsDeleteAll(0, "VIS_TL_");
-   // Draw lines for each open trade
    for(int t = 0; t < ArraySize(g_Trades); t++) {
-      TradeState ts = g_Trades[t];
-      datetime   t1 = TimeCurrent() - PeriodSeconds(PERIOD_H1) * 4;
-      datetime   t2 = TimeCurrent() + PeriodSeconds(PERIOD_H1) * 8;
+      TradeState ts  = g_Trades[t];
+      if(ts.ticket  == 0) continue;
       string     pfx = "VIS_TL_" + IntegerToString(ts.ticket);
-
-      DrawHLine(pfx + "_SL",  ts.initialSL, ColorSL_Line,  STYLE_SOLID, 2, "SL");
-      DrawHLine(pfx + "_TP1", ts.tp1Price,  ColorTP1_Line, STYLE_DASH,  1, "TP1");
-      DrawHLine(pfx + "_TP2", ts.tp2Price,  ColorTP2_Line, STYLE_SOLID, 1, "TP2");
-      DrawHLine(pfx + "_EN",  ts.entryPrice, clrWhite,     STYLE_DOT,   1, "Entry");
+      DrawHLine(pfx + "_SL",  ts.initialSL,  ColorSL_Line,  STYLE_SOLID, 2, "SL");
+      DrawHLine(pfx + "_TP1", ts.tp1Price,   ColorTP1_Line, STYLE_DASH,  1, "TP1");
+      DrawHLine(pfx + "_TP2", ts.tp2Price,   ColorTP2_Line, STYLE_SOLID, 1, "TP2");
+      DrawHLine(pfx + "_EN",  ts.entryPrice, clrWhite,      STYLE_DOT,   1, "Entry");
    }
 }
 
@@ -2894,9 +2918,10 @@ string TR(string label, string value) {
 //| Dashboard creation — all labels                                 |
 //+------------------------------------------------------------------+
 void CreateDashboard() {
-   // Background rectangle
+   // Background rectangle — height calculated to cover all rows including tertiary tier
+   // ROW_HEIGHT * 170 covers all current dashboard sections with room to spare
    CreateRect(PREFIX+"BG", Dashboard_X - 5, Dashboard_Y - 5,
-              DASH_WIDTH, ROW_HEIGHT * 145 + 10, ColorBG);
+              DASH_WIDTH, ROW_HEIGHT * 170 + 10, ColorBG);
 }
 
 //+------------------------------------------------------------------+
