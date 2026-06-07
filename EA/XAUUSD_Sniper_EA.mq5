@@ -117,6 +117,25 @@ input double           SL_BufferPips     = 5.0;    // Extra pips beyond sweep fo
 input int              CooldownBars      = 3;      // Bars to wait after last trade before new entry
 input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time (overridden by scaled entries)
 
+input group            "=== SESSION-SPECIFIC SETTINGS ==="
+// ── London Open (3PM-5PM PHT) — trending, Judas Sweep reversal ──
+input double           LondonRisk         = 2.0;    // London Open risk % (full — best trending window)
+input int              LondonMinScore     = 7;      // Min score for London Open trades
+input double           LondonTP2_RR       = 3.0;    // London TP2 RR (wider — trending moves)
+// ── London Session (5PM-8PM PHT) — selective, continuation only ──
+input double           LondonMidRisk      = 1.5;    // London Mid risk % (reduced — selective trades only)
+input int              LondonMidMinScore  = 9;      // Min score for London Mid (higher bar)
+input int              LondonMidMaxTrades = 1;      // Max simultaneous trades during London Mid
+// ── NY Open (8PM-11PM PHT) — best window, full power ──
+input double           NYOpenRisk         = 2.0;    // NY Open risk % (full — highest-probability window)
+input int              NYOpenMinScore     = 7;      // Min score for NY Open
+input double           NYOpenTP2_RR       = 3.5;    // NY Open TP2 RR (slightly wider — strong momentum)
+// ── NY PM / Silver Bullet (11PM-1AM PHT) — wind down, SB only ──
+input double           NYPMRisk           = 1.0;    // NY PM risk % (reduced — wind-down, SB setups only)
+input int              NYPMMinScore       = 9;      // Min score for NY PM entries
+input double           NYPMMaxTrades_New  = 1;      // No new trades if already 1 open during NY PM
+input double           NYPMTP2_RR         = 2.0;    // NY PM TP2 RR (tighter — less time left in session)
+
 input group            "=== ASIAN SESSION (5AM-7AM PHT) ==="
 input bool             TradeAsianSession  = true;   // Allow trades during Asian KZ (5AM-7AM PHT)
 input double           AsianRisk          = 0.5;    // Risk % during Asian session (smaller — range market)
@@ -296,7 +315,7 @@ string     g_CandlePattern     = "None"; // Pattern detected: Engulf / PinBar / 
 //| Adaptive Learning — confluence snapshot at trade entry          |
 //+------------------------------------------------------------------+
 #define CONFLUENCE_COUNT 20
-#define SESSION_COUNT     4
+#define SESSION_COUNT     6
 
 string g_ConfluenceNames[CONFLUENCE_COUNT] = {
    "H4 ExtBOS",  "H4 MSS",       "H4 FreshOB",  "H4 AtSR",
@@ -306,8 +325,16 @@ string g_ConfluenceNames[CONFLUENCE_COUNT] = {
    "SilverBull", "DXY Aligned",  "CandleConf",  "Key Session"
 };
 
+// Session index constants — must match g_SessionNames order
+#define SESS_ASIAN       0
+#define SESS_LONDON_OPEN 1
+#define SESS_LONDON_MID  2
+#define SESS_NY_OPEN     3
+#define SESS_NY_PM       4
+#define SESS_OTHER       5
+
 string g_SessionNames[SESSION_COUNT] = {
-   "London Open", "London Mid", "NY Open", "Other"
+   "Asian KZ", "London Open", "London Mid", "NY Open", "NY PM/SB", "Other"
 };
 
 struct ConfluenceStats {
@@ -1177,35 +1204,135 @@ int GetMaxEntriesForScore(int score) {
 }
 
 //+------------------------------------------------------------------+
+//| Session index from current session string                       |
+//+------------------------------------------------------------------+
+int GetSessionIndex() {
+   if(g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)")       return SESS_ASIAN;
+   if(g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)")           return SESS_LONDON_OPEN;
+   if(g_Session == "London Session — Selective Trades (5PM-8PM PHT)")      return SESS_LONDON_MID;
+   if(g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)")           return SESS_NY_OPEN;
+   if(g_Session == "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)")     return SESS_NY_PM;
+   return SESS_OTHER;
+}
+
+//+------------------------------------------------------------------+
+//| Per-session parameters: risk, min score, max trades, TP2 RR     |
+//+------------------------------------------------------------------+
+struct SessionParams {
+   double risk;
+   int    minScore;
+   int    maxNewTrades;  // Max NEW trades allowed (0 = session blocked)
+   double tp1RR;
+   double tp2RR;
+   string tag;
+};
+
+SessionParams GetSessionParams() {
+   SessionParams p;
+   int si = GetSessionIndex();
+
+   switch(si) {
+      case SESS_ASIAN:
+         p.risk         = AsianRisk;
+         p.minScore     = AsianMinScore;
+         p.maxNewTrades = 1;
+         p.tp1RR        = AsianTP1_RR;
+         p.tp2RR        = AsianTP2_RR;
+         p.tag          = "[ASIAN-RANGE]";
+         break;
+      case SESS_LONDON_OPEN:
+         p.risk         = LondonRisk;
+         p.minScore     = LondonMinScore;
+         p.maxNewTrades = 99; // scaled entries decide
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = LondonTP2_RR;
+         p.tag          = "[LONDON-OPEN]";
+         break;
+      case SESS_LONDON_MID:
+         p.risk         = LondonMidRisk;
+         p.minScore     = LondonMidMinScore;
+         p.maxNewTrades = LondonMidMaxTrades;
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = TP2_RR;
+         p.tag          = "[LONDON-MID]";
+         break;
+      case SESS_NY_OPEN:
+         p.risk         = NYOpenRisk;
+         p.minScore     = NYOpenMinScore;
+         p.maxNewTrades = 99; // scaled entries decide
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = NYOpenTP2_RR;
+         p.tag          = "[NY-OPEN]";
+         break;
+      case SESS_NY_PM:
+         p.risk         = NYPMRisk;
+         p.minScore     = NYPMMinScore;
+         p.maxNewTrades = (int)NYPMMaxTrades_New;
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = NYPMTP2_RR;
+         p.tag          = "[NY-PM/SB]";
+         break;
+      default: // SESS_OTHER / blocked
+         p.risk         = TertiaryRisk;
+         p.minScore     = 999; // effectively blocked
+         p.maxNewTrades = 0;
+         p.tp1RR        = TP1_RR;
+         p.tp2RR        = TP2_RR;
+         p.tag          = "";
+         break;
+   }
+   return p;
+}
+
+//+------------------------------------------------------------------+
 //| Auto Entry — fires when confluence score meets threshold         |
 //+------------------------------------------------------------------+
 void TryAutoEntry() {
    if(!IsTradingAllowed()) return;
 
-   // Determine if current session allows trading
-   bool inAsian   = (g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)");
-   bool inSession = (g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)"      ||
-                     g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)"       ||
-                     g_Session == "London Session — Selective Trades (5PM-8PM PHT)"  ||
-                     g_Session == "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)" ||
-                     (inAsian && TradeAsianSession));
-   if(!inSession) { g_AlertSent = false; return; }
+   // Load per-session parameters
+   SessionParams sp = GetSessionParams();
+   int curSessIdx   = GetSessionIndex();
 
-   // Asian session: apply tighter filters before cascade check
-   if(inAsian) {
-      // Spread check — Asian spreads can spike
-      double spreadPips = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
-                          SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0 /
-                          (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0);
+   // Block sessions that are not in a trade window
+   bool isAsian  = (curSessIdx == SESS_ASIAN);
+   bool inSession = (curSessIdx != SESS_OTHER) &&
+                    !(isAsian && !TradeAsianSession);
+   if(!inSession || sp.maxNewTrades == 0) { g_AlertSent = false; return; }
+
+   // NY PM: block new trades if already at limit
+   if(curSessIdx == SESS_NY_PM && CountOpenTrades() >= sp.maxNewTrades) {
+      g_EntryLog = "NY PM: Max trades open — manage existing position, no new entries";
+      return;
+   }
+
+   // London Mid: max trades cap
+   if(curSessIdx == SESS_LONDON_MID && CountOpenTrades() >= sp.maxNewTrades) {
+      g_EntryLog = "London Mid (Selective): Already 1 trade open — waiting for close";
+      return;
+   }
+
+   // Asian session: spread and range-extreme filters
+   if(isAsian) {
+      double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
       double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
                          SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 0.1;
       if(curSpread > AsianMaxSpread) {
          g_EntryLog = StringFormat("Asian KZ: Spread %.1f pips > max %.1f — waiting", curSpread, AsianMaxSpread);
          return;
       }
-      // Range-only mode: require liquidity sweep + fresh OB at extremes
       if(AsianRangeOnly && !(g_M15.hasLiqSweep && g_M15.hasFreshOB)) {
          g_EntryLog = "Asian KZ (Range Mode): Need sweep + fresh OB at range extreme — waiting";
+         return;
+      }
+   }
+
+   // NY PM / Silver Bullet: require Silver Bullet window or high score
+   if(curSessIdx == SESS_NY_PM) {
+      bool inSB = g_M15.inSilverBullet || g_M5.inSilverBullet || g_M1.inSilverBullet;
+      if(!inSB && g_PrimaryScore < sp.minScore + 2) {
+         g_EntryLog = "NY PM: Outside Silver Bullet window — need score " +
+                      IntegerToString(sp.minScore + 2) + "+ to trade";
          return;
       }
    }
@@ -1220,12 +1347,10 @@ void TryAutoEntry() {
    int    effectiveFallScore  = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
    int    effectiveTertScore  = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
 
-   // Asian session: raise score bar — only high-confidence range reversals
-   if(inAsian) {
-      effectivePrimScore  = MathMax(effectivePrimScore,  AsianMinScore);
-      effectiveFallScore  = MathMax(effectiveFallScore,  AsianMinScore);
-      effectiveTertScore  = MathMax(effectiveTertScore,  AsianMinScore);
-   }
+   // Apply per-session score floor
+   effectivePrimScore = MathMax(effectivePrimScore, sp.minScore);
+   effectiveFallScore = MathMax(effectiveFallScore, sp.minScore);
+   effectiveTertScore = MathMax(effectiveTertScore, sp.minScore);
 
    // Check session suspension
    if(IsSessionSuspended()) {
@@ -1271,16 +1396,11 @@ void TryAutoEntry() {
       entryTF  = TF_M1;
    }
 
-   // ── ASIAN SESSION OVERRIDES ──
-   // Apply smaller risk and tighter TP targets — range reversal, not trend trade
-   double effectiveTP1_RR = TP1_RR;
-   double effectiveTP2_RR = TP2_RR;
-   if(inAsian) {
-      riskPct        = AsianRisk;
-      effectiveTP1_RR = AsianTP1_RR;
-      effectiveTP2_RR = AsianTP2_RR;
-      strategy += "_ASIAN"; // Tag so journal/reporting identifies it
-   }
+   // ── PER-SESSION RISK & TP OVERRIDES ──
+   double effectiveTP1_RR = sp.tp1RR;
+   double effectiveTP2_RR = sp.tp2RR;
+   riskPct = sp.risk;
+   if(StringLen(sp.tag) > 0) strategy += "_" + StringSubstr(sp.tag, 1, StringLen(sp.tag)-2);
 
    // ── SCALED ENTRY GATE — check how many trades are already open ──
    int openNow    = CountOpenTrades();
@@ -1343,9 +1463,10 @@ void TryAutoEntry() {
                    / pip + SL_BufferPips;
    slPips = MathMax(slPips, 10.0); // Minimum 10 pip SL
 
-   // Check minimum RR (Asian uses its own tighter targets — skip global MinRR check)
+   // Check minimum RR — sessions with custom TP targets bypass the global MinRR
    double tp2Pips = slPips * effectiveTP2_RR;
-   if(!inAsian && tp2Pips / slPips < MinRR) return;
+   bool customTP = (curSessIdx == SESS_ASIAN || curSessIdx == SESS_NY_PM);
+   if(!customTP && tp2Pips / slPips < MinRR) return;
 
    // Calculate lot size using exact SL
    double lots = CalcLotSize(riskPct, slPips);
@@ -2117,14 +2238,10 @@ TradeSnapshot CaptureSnapshot(ulong ticket, string strategy) {
    snap.confluences[16] = g_M15.inSilverBullet;
    snap.confluences[17] = g_DXY_Available ? !g_DXY_Bullish : false;
    snap.confluences[18] = g_CandleConfirmed;
-   snap.confluences[19] = (g_Session == "London Open — TRADE WINDOW 1" ||
-                           g_Session == "New York Open — TRADE WINDOW 2 (BEST)");
+   snap.confluences[19] = (GetSessionIndex() == SESS_LONDON_OPEN ||
+                           GetSessionIndex() == SESS_NY_OPEN);
 
-   // Determine session index
-   if(g_Session == "London Open — TRADE WINDOW 1")           snap.sessionIdx = 0;
-   else if(g_Session == "London Session (Selective)")         snap.sessionIdx = 1;
-   else if(g_Session == "New York Open — TRADE WINDOW 2 (BEST)") snap.sessionIdx = 2;
-   else                                                        snap.sessionIdx = 3;
+   snap.sessionIdx = GetSessionIndex();
 
    return snap;
 }
@@ -2265,10 +2382,7 @@ double ConfluenceValue(int idx) {
 //--- Check if current session is suspended by learning system
 bool IsSessionSuspended() {
    if(!UseAdaptiveLearning || !SuspendBadSessions) return false;
-   int si = 3; // default Other
-   if(g_Session == "London Open — TRADE WINDOW 1")            si = 0;
-   else if(g_Session == "London Session (Selective)")          si = 1;
-   else if(g_Session == "New York Open — TRADE WINDOW 2 (BEST)") si = 2;
+   int si = GetSessionIndex();
    return g_SessStats[si].suspended;
 }
 
@@ -2369,26 +2483,19 @@ string GetRecommendation() {
    if(!IsTradingAllowed())
       return StringFormat("BLOCKED: %s", g_BlockReason);
 
-   bool isAsianRec = (g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)");
-   bool inTradeSession = (g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)"      ||
-                          g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)"       ||
-                          g_Session == "London Session — Selective Trades (5PM-8PM PHT)"  ||
-                          g_Session == "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)" ||
-                          (isAsianRec && TradeAsianSession));
+   SessionParams rsp    = GetSessionParams();
+   int           rsi    = GetSessionIndex();
+   bool isAsianRec      = (rsi == SESS_ASIAN);
+   bool inTradeSession  = (rsi != SESS_OTHER) &&
+                          !(isAsianRec && !TradeAsianSession) &&
+                          (rsp.maxNewTrades > 0);
 
    if(!inTradeSession)
       return "NOT IN TRADING SESSION — PREPARE ONLY";
 
-   int effPrim = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
-   int effFall = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
-   int effTert = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
-
-   // Asian: raise score floor for recommendations
-   if(isAsianRec) {
-      effPrim = MathMax(effPrim, AsianMinScore);
-      effFall = MathMax(effFall, AsianMinScore);
-      effTert = MathMax(effTert, AsianMinScore);
-   }
+   int effPrim = MathMax(UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore,  rsp.minScore);
+   int effFall = MathMax(UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore, rsp.minScore);
+   int effTert = MathMax(UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore, rsp.minScore);
 
    // Check session suspension
    if(IsSessionSuspended())
@@ -2397,10 +2504,10 @@ string GetRecommendation() {
 
    int openNow = CountOpenTrades();
 
-   string asianTag = isAsianRec ? " [ASIAN-RANGE]" : "";
-   double actPrimRisk = isAsianRec ? AsianRisk : PrimaryRisk;
-   double actFallRisk = isAsianRec ? AsianRisk : FallbackRisk;
-   double actTertRisk = isAsianRec ? AsianRisk : TertiaryRisk;
+   string asianTag    = " " + rsp.tag;
+   double actPrimRisk = rsp.risk;
+   double actFallRisk = rsp.risk;
+   double actTertRisk = rsp.risk;
 
    // Tier 1 — Primary: H4 → H1 → M15
    if(g_PrimaryScore >= effPrim) {
@@ -3161,12 +3268,19 @@ void UpdateDashboard() {
             ColorNeutral, FontSize);
    y += dy;
 
-   // Session
-   color sessionColor = (StringFind(g_Session, "TRADE") >= 0) ? ColorBull :
-                        (StringFind(g_Session, "Prepare") >= 0 ||
-                         StringFind(g_Session, "After") >= 0) ? ColorWarn : ColorNeutral;
+   // Session + active parameters
+   int    dsi = GetSessionIndex();
+   SessionParams dsp = GetSessionParams();
+   color sessionColor = (dsi == SESS_LONDON_OPEN || dsi == SESS_NY_OPEN) ? ColorBull :
+                        (dsi == SESS_ASIAN || dsi == SESS_LONDON_MID || dsi == SESS_NY_PM) ? ColorWarn :
+                        ColorNeutral;
    SetLabel(PREFIX+"T2", x, y,
             StringFormat("Session: %s", g_Session), sessionColor, FontSize);
+   y += dy;
+   string sessParamStr = StringFormat("Risk: %.1f%%  |  Min Score: %d  |  TP2 RR: 1:%.1f  |  Max New Trades: %s",
+      dsp.risk, dsp.minScore, dsp.tp2RR,
+      dsp.maxNewTrades >= 99 ? "Scaled" : IntegerToString(dsp.maxNewTrades));
+   SetLabel(PREFIX+"T2b", x, y, sessParamStr, sessionColor, FontSize);
    y += dy + 4;
 
    // ── PRIMARY STRATEGY H4 / H1 / M15 ──
