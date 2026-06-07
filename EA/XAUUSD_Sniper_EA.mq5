@@ -117,6 +117,15 @@ input double           SL_BufferPips     = 5.0;    // Extra pips beyond sweep fo
 input int              CooldownBars      = 3;      // Bars to wait after last trade before new entry
 input bool             OneTradeAtATime   = true;   // Allow only 1 open trade at a time (overridden by scaled entries)
 
+input group            "=== ASIAN SESSION (5AM-7AM PHT) ==="
+input bool             TradeAsianSession  = true;   // Allow trades during Asian KZ (5AM-7AM PHT)
+input double           AsianRisk          = 0.5;    // Risk % during Asian session (smaller — range market)
+input int              AsianMinScore      = 9;      // Minimum score to trade Asian session (higher bar)
+input double           AsianTP1_RR        = 0.8;    // TP1 RR for Asian (tighter — range fading)
+input double           AsianTP2_RR        = 1.5;    // TP2 RR for Asian (target opposite range wall)
+input double           AsianMaxSpread     = 20.0;   // Block Asian trade if spread > this (pips)
+input bool             AsianRangeOnly     = true;   // Asian: only trade at range extremes (OB + sweep)
+
 input group            "=== SCALED ENTRIES (SCORE-BASED) ==="
 input bool             UseScaledEntries  = true;   // Scale max simultaneous trades by confluence score
 input int              ScaledScore1      = 8;      // Score threshold for 1 entry
@@ -369,6 +378,8 @@ string     g_BlockReason       = "";     // Why trading is blocked
 //--- Auto entry state
 datetime   g_LastEntryBar      = 0;
 int        g_LastSignalScore   = 0;
+double     g_LastTP1RR         = 1.0; // Effective TP1 RR used at entry (may differ in Asian session)
+double     g_LastTP2RR         = 3.0; // Effective TP2 RR used at entry
 bool       g_AlertSent         = false;
 string     g_LastTradeResult   = "";
 string     g_EntryLog          = "";
@@ -1171,11 +1182,33 @@ int GetMaxEntriesForScore(int score) {
 void TryAutoEntry() {
    if(!IsTradingAllowed()) return;
 
-   // Only enter during valid sessions
-   bool inSession = (g_Session == "London Open — TRADE WINDOW 1"      ||
-                     g_Session == "New York Open — TRADE WINDOW 2 (BEST)" ||
-                     g_Session == "London Session (Selective)");
+   // Determine if current session allows trading
+   bool inAsian   = (g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)");
+   bool inSession = (g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)"      ||
+                     g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)"       ||
+                     g_Session == "London Session — Selective Trades (5PM-8PM PHT)"  ||
+                     g_Session == "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)" ||
+                     (inAsian && TradeAsianSession));
    if(!inSession) { g_AlertSent = false; return; }
+
+   // Asian session: apply tighter filters before cascade check
+   if(inAsian) {
+      // Spread check — Asian spreads can spike
+      double spreadPips = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+                          SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0 /
+                          (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0);
+      double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+                         SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 0.1;
+      if(curSpread > AsianMaxSpread) {
+         g_EntryLog = StringFormat("Asian KZ: Spread %.1f pips > max %.1f — waiting", curSpread, AsianMaxSpread);
+         return;
+      }
+      // Range-only mode: require liquidity sweep + fresh OB at extremes
+      if(AsianRangeOnly && !(g_M15.hasLiqSweep && g_M15.hasFreshOB)) {
+         g_EntryLog = "Asian KZ (Range Mode): Need sweep + fresh OB at range extreme — waiting";
+         return;
+      }
+   }
 
    // Check cooldown — wait for new bar between entries
    datetime currentBar = iTime(_Symbol, TF_M15, 0);
@@ -1186,6 +1219,13 @@ void TryAutoEntry() {
    int    effectivePrimScore  = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
    int    effectiveFallScore  = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
    int    effectiveTertScore  = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
+
+   // Asian session: raise score bar — only high-confidence range reversals
+   if(inAsian) {
+      effectivePrimScore  = MathMax(effectivePrimScore,  AsianMinScore);
+      effectiveFallScore  = MathMax(effectiveFallScore,  AsianMinScore);
+      effectiveTertScore  = MathMax(effectiveTertScore,  AsianMinScore);
+   }
 
    // Check session suspension
    if(IsSessionSuspended()) {
@@ -1229,6 +1269,17 @@ void TryAutoEntry() {
       riskPct  = TertiaryRisk;
       strategy = "TERTIARY";
       entryTF  = TF_M1;
+   }
+
+   // ── ASIAN SESSION OVERRIDES ──
+   // Apply smaller risk and tighter TP targets — range reversal, not trend trade
+   double effectiveTP1_RR = TP1_RR;
+   double effectiveTP2_RR = TP2_RR;
+   if(inAsian) {
+      riskPct        = AsianRisk;
+      effectiveTP1_RR = AsianTP1_RR;
+      effectiveTP2_RR = AsianTP2_RR;
+      strategy += "_ASIAN"; // Tag so journal/reporting identifies it
    }
 
    // ── SCALED ENTRY GATE — check how many trades are already open ──
@@ -1292,9 +1343,9 @@ void TryAutoEntry() {
                    / pip + SL_BufferPips;
    slPips = MathMax(slPips, 10.0); // Minimum 10 pip SL
 
-   // Check minimum RR
-   double tp2Pips = slPips * TP2_RR;
-   if(tp2Pips / slPips < MinRR) return;
+   // Check minimum RR (Asian uses its own tighter targets — skip global MinRR check)
+   double tp2Pips = slPips * effectiveTP2_RR;
+   if(!inAsian && tp2Pips / slPips < MinRR) return;
 
    // Calculate lot size using exact SL
    double lots = CalcLotSize(riskPct, slPips);
@@ -1305,8 +1356,8 @@ void TryAutoEntry() {
    double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double entry  = isBuy ? ask : bid;
    double sl     = isBuy ? entry - slPips * pip : entry + slPips * pip;
-   double tp1    = isBuy ? entry + slPips * TP1_RR * pip : entry - slPips * TP1_RR * pip;
-   double tp2    = isBuy ? entry + slPips * TP2_RR * pip : entry - slPips * TP2_RR * pip;
+   double tp1    = isBuy ? entry + slPips * effectiveTP1_RR * pip : entry - slPips * effectiveTP1_RR * pip;
+   double tp2    = isBuy ? entry + slPips * effectiveTP2_RR * pip : entry - slPips * effectiveTP2_RR * pip;
 
    sl  = NormalizeDouble(sl,  _Digits);
    tp2 = NormalizeDouble(tp2, _Digits);
@@ -1355,6 +1406,9 @@ void TryAutoEntry() {
 
    // Auto execute if enabled
    if(!AutoTrade) return;
+
+   g_LastTP1RR = effectiveTP1_RR;
+   g_LastTP2RR = effectiveTP2_RR;
 
    bool ok = false;
    if(isBuy)
@@ -1437,7 +1491,7 @@ void ManageCapitalProtection() {
       // ── Find or create trade state ──
       int idx = FindTradeState(ticket);
       if(idx < 0) {
-         idx = RegisterTrade(ticket, entry, currentSL, isBuy, lots);
+         idx = RegisterTrade(ticket, entry, currentSL, isBuy, lots, g_LastTP1RR, g_LastTP2RR);
          if(idx < 0) continue;
       }
 
@@ -1524,9 +1578,11 @@ int FindTradeState(ulong ticket) {
 //| Register a new trade in state array                             |
 //+------------------------------------------------------------------+
 int RegisterTrade(ulong ticket, double entry, double sl,
-                  bool isBuy, double lots) {
-   double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
-   double slDist    = MathAbs(entry - sl);
+                  bool isBuy, double lots,
+                  double tp1RR = -1.0, double tp2RR = -1.0) {
+   double slDist = MathAbs(entry - sl);
+   double r1     = (tp1RR > 0) ? tp1RR : TP1_RR;
+   double r2     = (tp2RR > 0) ? tp2RR : TP2_RR;
 
    int idx = ArraySize(g_Trades);
    ArrayResize(g_Trades, idx + 1);
@@ -1538,10 +1594,8 @@ int RegisterTrade(ulong ticket, double entry, double sl,
    g_Trades[idx].initialSL     = sl;
    g_Trades[idx].isBuy         = isBuy;
    g_Trades[idx].lotSize       = lots;
-   g_Trades[idx].tp1Price      = isBuy ? entry + slDist * TP1_RR
-                                        : entry - slDist * TP1_RR;
-   g_Trades[idx].tp2Price      = isBuy ? entry + slDist * TP2_RR
-                                        : entry - slDist * TP2_RR;
+   g_Trades[idx].tp1Price      = isBuy ? entry + slDist * r1 : entry - slDist * r1;
+   g_Trades[idx].tp2Price      = isBuy ? entry + slDist * r2 : entry - slDist * r2;
    return idx;
 }
 
@@ -2315,9 +2369,12 @@ string GetRecommendation() {
    if(!IsTradingAllowed())
       return StringFormat("BLOCKED: %s", g_BlockReason);
 
-   bool inTradeSession = (g_Session == "London Open — TRADE WINDOW 1" ||
-                          g_Session == "New York Open — TRADE WINDOW 2 (BEST)" ||
-                          g_Session == "London Session (Selective)");
+   bool isAsianRec = (g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)");
+   bool inTradeSession = (g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)"      ||
+                          g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)"       ||
+                          g_Session == "London Session — Selective Trades (5PM-8PM PHT)"  ||
+                          g_Session == "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)" ||
+                          (isAsianRec && TradeAsianSession));
 
    if(!inTradeSession)
       return "NOT IN TRADING SESSION — PREPARE ONLY";
@@ -2326,6 +2383,13 @@ string GetRecommendation() {
    int effFall = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
    int effTert = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
 
+   // Asian: raise score floor for recommendations
+   if(isAsianRec) {
+      effPrim = MathMax(effPrim, AsianMinScore);
+      effFall = MathMax(effFall, AsianMinScore);
+      effTert = MathMax(effTert, AsianMinScore);
+   }
+
    // Check session suspension
    if(IsSessionSuspended())
       return StringFormat("SESSION SUSPENDED by learning system — %s below %.0f%% win rate",
@@ -2333,34 +2397,39 @@ string GetRecommendation() {
 
    int openNow = CountOpenTrades();
 
+   string asianTag = isAsianRec ? " [ASIAN-RANGE]" : "";
+   double actPrimRisk = isAsianRec ? AsianRisk : PrimaryRisk;
+   double actFallRisk = isAsianRec ? AsianRisk : FallbackRisk;
+   double actTertRisk = isAsianRec ? AsianRisk : TertiaryRisk;
+
    // Tier 1 — Primary: H4 → H1 → M15
    if(g_PrimaryScore >= effPrim) {
       string dir    = g_H4.bullish ? "BUY" : "SELL";
-      double lots   = CalcLotSize(PrimaryRisk, 15.0);
+      double lots   = CalcLotSize(actPrimRisk, 15.0);
       g_LastLotSize = lots;
       int    maxEnt = GetMaxEntriesForScore(g_PrimaryScore);
-      return StringFormat("▶ PRIMARY  (H4→H1→M15): %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
-                          dir, g_PrimaryScore, PrimaryRisk, lots, openNow, maxEnt);
+      return StringFormat("▶ PRIMARY  (H4→H1→M15)%s: %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+                          asianTag, dir, g_PrimaryScore, actPrimRisk, lots, openNow, maxEnt);
    }
 
    // Tier 2 — Fallback: H1 → M15 → M5
    if(g_FallbackScore >= effFall) {
       string dir    = g_H1.bullish ? "BUY" : "SELL";
-      double lots   = CalcLotSize(FallbackRisk, 10.0);
+      double lots   = CalcLotSize(actFallRisk, 10.0);
       g_LastLotSize = lots;
       int    maxEnt = GetMaxEntriesForScore(g_FallbackScore);
-      return StringFormat("▶ FALLBACK (H1→M15→M5): %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
-                          dir, g_FallbackScore, FallbackRisk, lots, openNow, maxEnt);
+      return StringFormat("▶ FALLBACK (H1→M15→M5)%s: %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+                          asianTag, dir, g_FallbackScore, actFallRisk, lots, openNow, maxEnt);
    }
 
    // Tier 3 — Tertiary scalp: M15 → M5 → M1
    if(g_TertiaryScore >= effTert) {
       string dir    = g_M15.bullish ? "BUY" : "SELL";
-      double lots   = CalcLotSize(TertiaryRisk, 7.0);
+      double lots   = CalcLotSize(actTertRisk, 7.0);
       g_LastLotSize = lots;
       int    maxEnt = GetMaxEntriesForScore(g_TertiaryScore);
-      return StringFormat("▶ SCALP    (M15→M5→M1): %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
-                          dir, g_TertiaryScore, TertiaryRisk, lots, openNow, maxEnt);
+      return StringFormat("▶ SCALP    (M15→M5→M1)%s: %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+                          asianTag, dir, g_TertiaryScore, actTertRisk, lots, openNow, maxEnt);
    }
 
    // No tier ready
