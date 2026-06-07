@@ -76,6 +76,59 @@ struct SMCAnalysis {
    bool     belowAsianLow;      // Price broke below Asian range
    bool     inSilverBullet;     // Within ICT Silver Bullet time window
 
+   //--- ICT Killzones (UTC-based)
+   bool     inLondonKZ;         // 07:00-09:00 UTC (3PM-5PM PHT)
+   bool     inNYAmKZ;           // 12:00-15:00 UTC (8PM-11PM PHT)
+   bool     inNYPMKZ;           // 15:00-17:00 UTC (11PM-1AM PHT)
+   bool     inAsianKZ;          // 21:00-23:00 UTC (5AM-7AM PHT)
+   string   killzoneName;       // Active killzone label
+
+   //--- Midnight Open & Opening Gaps
+   double   midnightOpen;       // NY midnight price (05:00 UTC)
+   bool     nearMidnightOpen;   // Price within range of midnight open
+   bool     hasNDOG;            // New Day Opening Gap (today's open ≠ yesterday's close)
+   double   ndogHigh;
+   double   ndogLow;
+   bool     hasNWOG;            // New Week Opening Gap (week open ≠ prev week close)
+   double   nwogHigh;
+   double   nwogLow;
+
+   //--- Power of 3 (Accumulation → Manipulation → Distribution)
+   bool     po3Accumulation;    // Tight Asian consolidation
+   bool     po3Manipulation;    // Judas sweep occurred
+   bool     po3Distribution;    // Real trend direction after manipulation
+   string   po3Phase;
+
+   //--- ICT Macros (ultra-precise high-probability windows)
+   bool     inICTMacro;
+   string   macroName;
+
+   //--- Consequent Encroachment (CE = 50% of FVG — ideal entry)
+   bool     atCE;
+   double   ceLevel;
+
+   //--- IPDA — Interbank Price Delivery Algorithm (20/40/60 day ranges)
+   double   ipda20High;
+   double   ipda20Low;
+   double   ipda40High;
+   double   ipda40Low;
+   double   ipda60High;
+   double   ipda60Low;
+   bool     atIPDALevel;        // Price near an IPDA boundary
+
+   //--- Balanced Price Range (overlapping bull + bear FVG — strongest zone)
+   bool     hasBPR;
+   double   bprHigh;
+   double   bprLow;
+
+   //--- Strong vs Weak Highs/Lows (ICT sweep targeting)
+   bool     hasWeakHigh;        // High without BOS confirmation = sweep target
+   double   weakHigh;
+   bool     hasWeakLow;         // Low without BOS confirmation = sweep target
+   double   weakLow;
+   double   strongHigh;         // High confirmed by BOS
+   double   strongLow;          // Low confirmed by BOS
+
    //--- Premium / Discount
    bool     inDiscount;
    bool     inPremium;
@@ -494,7 +547,6 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    MqlDateTime dt;
    TimeToStruct(TimeGMT(), dt);
    int phtHour = (dt.hour + 8) % 24;
-   // At London open (3PM PHT) or NY open (8PM PHT)
    bool atSessionOpen = (phtHour == 15 || phtHour == 20);
    if(atSessionOpen && a.hasLiqSweep && a.hasCHoCH)
       a.isJudasSwing = true;
@@ -505,10 +557,212 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    a.inSilverBullet = (phtHour == 22);
 
    //================================================================
-   // REJECTION BLOCK — series of wicks at same level
+   // REJECTION BLOCK / PROPULSION BLOCK
    //================================================================
    a.hasPropulsionOB = DetectPropulsionBlock(high, low, close, open,
                                               a.bullish, lookback);
+
+   //================================================================
+   // ICT KILLZONES (UTC hours)
+   //================================================================
+   int utcH = dt.hour;
+   int utcM = dt.min;
+   int utcT = utcH * 100 + utcM; // HHMM integer for range checks
+   a.inAsianKZ   = (utcT >= 2100 || utcT <  2300);
+   a.inLondonKZ  = (utcT >= 700  && utcT <   900);
+   a.inNYAmKZ    = (utcT >= 1200 && utcT <  1500);
+   a.inNYPMKZ    = (utcT >= 1500 && utcT <  1700);
+   a.killzoneName = a.inLondonKZ ? "London KZ (3PM-5PM PHT)" :
+                    a.inNYAmKZ   ? "NY AM KZ (8PM-11PM PHT)" :
+                    a.inNYPMKZ   ? "NY PM/Close KZ (11PM-1AM PHT)" :
+                    a.inAsianKZ  ? "Asian KZ (5AM-7AM PHT)" : "No Active KZ";
+
+   //================================================================
+   // ICT MACROS (UTC times — NY EST + 5 hours)
+   // NY 02:33-03:00 | 04:03-04:30 | 08:50-09:10 | 10:10-10:40 | 11:50-12:10
+   //================================================================
+   int macroStart[5] = {733, 903, 1350, 1510, 1650};
+   int macroEnd[5]   = {800, 930, 1410, 1540, 1710};
+   string macroLabels[5] = {
+      "London Macro (3:33-4:00 PHT)",
+      "London AM Macro (5:03-5:30 PHT)",
+      "NY Pre-Market Macro (9:50-10:10 PHT — 21:50 PHT)",
+      "NY AM Macro (11:10-11:40 PHT — 23:10 PHT)",
+      "Lunch Macro (12:50-1:10 PHT)"
+   };
+   a.inICTMacro = false;
+   a.macroName  = "";
+   for(int mi = 0; mi < 5; mi++) {
+      if(utcT >= macroStart[mi] && utcT <= macroEnd[mi]) {
+         a.inICTMacro = true;
+         a.macroName  = macroLabels[mi];
+         break;
+      }
+   }
+
+   //================================================================
+   // MIDNIGHT OPEN — NY midnight = 05:00 UTC (EST, approx)
+   //================================================================
+   a.midnightOpen    = 0;
+   a.nearMidnightOpen = false;
+   {
+      datetime midnightUTC = StringToTime(StringFormat("%04d.%02d.%02d 05:00",
+                                                        dt.year, dt.mon, dt.day));
+      double moOpen[];
+      ArraySetAsSeries(moOpen, false);
+      if(CopyOpen(symbol, PERIOD_H1, midnightUTC, 1, moOpen) > 0) {
+         a.midnightOpen     = moOpen[0];
+         a.nearMidnightOpen = (a.midnightOpen > 0 &&
+                               MathAbs(price - a.midnightOpen) < pip * 15);
+      }
+   }
+
+   //================================================================
+   // NEW DAY OPENING GAP (NDOG) & NEW WEEK OPENING GAP (NWOG)
+   //================================================================
+   a.hasNDOG = false; a.ndogHigh = 0; a.ndogLow = 0;
+   a.hasNWOG = false; a.nwogHigh = 0; a.nwogLow = 0;
+   {
+      double d1O[], d1C[];
+      ArraySetAsSeries(d1O, true); ArraySetAsSeries(d1C, true);
+      if(CopyOpen (symbol, PERIOD_D1, 0, 3, d1O) >= 2 &&
+         CopyClose(symbol, PERIOD_D1, 0, 3, d1C) >= 2) {
+         double gap = d1O[0] - d1C[1];
+         if(MathAbs(gap) > pip * 3) {
+            a.hasNDOG = true;
+            a.ndogHigh = MathMax(d1O[0], d1C[1]);
+            a.ndogLow  = MathMin(d1O[0], d1C[1]);
+         }
+      }
+      double w1O[], w1C[];
+      ArraySetAsSeries(w1O, true); ArraySetAsSeries(w1C, true);
+      if(CopyOpen (symbol, PERIOD_W1, 0, 3, w1O) >= 2 &&
+         CopyClose(symbol, PERIOD_W1, 0, 3, w1C) >= 2) {
+         double wgap = w1O[0] - w1C[1];
+         if(MathAbs(wgap) > pip * 5) {
+            a.hasNWOG = true;
+            a.nwogHigh = MathMax(w1O[0], w1C[1]);
+            a.nwogLow  = MathMin(w1O[0], w1C[1]);
+         }
+      }
+   }
+
+   //================================================================
+   // POWER OF 3 — Accumulation → Manipulation → Distribution
+   //================================================================
+   {
+      double asianRange = a.asianHigh - a.asianLow;
+      a.po3Accumulation = (asianRange > 0 && asianRange < pip * 40 && a.inAsianRange);
+      a.po3Manipulation = (a.hasLiqSweep &&
+                           (a.aboveAsianHigh || a.belowAsianLow) && a.hasCHoCH);
+      a.po3Distribution = (a.po3Manipulation && a.hasMSS && a.hasDisplacement);
+      a.po3Phase = a.po3Distribution ? "3-Distribution (TRADE NOW)" :
+                   a.po3Manipulation ? "2-Manipulation (Judas Active)" :
+                   a.po3Accumulation ? "1-Accumulation (Wait)" : "No PO3 Signal";
+   }
+
+   //================================================================
+   // CONSEQUENT ENCROACHMENT — 50% of FVG = CE level
+   //================================================================
+   a.atCE    = false;
+   a.ceLevel = 0;
+   if(a.hasFVGOpen && a.fvgMid > 0) {
+      a.ceLevel = a.fvgMid;
+      a.atCE    = (MathAbs(price - a.fvgMid) < pip * 5);
+   }
+
+   //================================================================
+   // IPDA — 20 / 40 / 60 day range boundaries
+   //================================================================
+   a.atIPDALevel = false;
+   a.ipda20High = a.ipda20Low = a.ipda40High = a.ipda40Low =
+   a.ipda60High = a.ipda60Low = 0;
+   {
+      double dH[], dL[];
+      ArraySetAsSeries(dH, true); ArraySetAsSeries(dL, true);
+      if(CopyHigh(symbol, PERIOD_D1, 0, 65, dH) >= 62 &&
+         CopyLow (symbol, PERIOD_D1, 0, 65, dL) >= 62) {
+         a.ipda20High = dH[ArrayMaximum(dH, 0, 20)];
+         a.ipda20Low  = dL[ArrayMinimum(dL, 0, 20)];
+         a.ipda40High = dH[ArrayMaximum(dH, 0, 40)];
+         a.ipda40Low  = dL[ArrayMinimum(dL, 0, 40)];
+         a.ipda60High = dH[ArrayMaximum(dH, 0, 60)];
+         a.ipda60Low  = dL[ArrayMinimum(dL, 0, 60)];
+         double ipdaLvl[6] = {a.ipda20High, a.ipda20Low,
+                               a.ipda40High, a.ipda40Low,
+                               a.ipda60High, a.ipda60Low};
+         for(int il = 0; il < 6; il++) {
+            if(ipdaLvl[il] > 0 && MathAbs(price - ipdaLvl[il]) < pip * 25) {
+               a.atIPDALevel = true; break;
+            }
+         }
+      }
+   }
+
+   //================================================================
+   // BALANCED PRICE RANGE — overlapping bull + bear FVG
+   //================================================================
+   a.hasBPR = false; a.bprHigh = 0; a.bprLow = 0;
+   if(a.hasFVGOpen && a.fvgHigh > 0) {
+      int bprLB = MathMin(30, lookback - 2);
+      for(int i = 2; i < bprLB - 1; i++) {
+         double oHi = 0, oLo = 0;
+         if(a.bullish && high[i-1] < low[i+1]) {        // bearish FVG in area
+            oHi = low[i+1]; oLo = high[i-1];
+         } else if(!a.bullish && low[i-1] > high[i+1]) { // bullish FVG in area
+            oHi = low[i-1]; oLo = high[i+1];
+         }
+         if(oHi > 0 && oLo < a.fvgHigh && oHi > a.fvgLow) {
+            a.hasBPR  = true;
+            a.bprHigh = MathMin(oHi, a.fvgHigh);
+            a.bprLow  = MathMax(oLo, a.fvgLow);
+            break;
+         }
+      }
+   }
+
+   //================================================================
+   // STRONG vs WEAK HIGHS/LOWS
+   // Strong = swing formed with a BOS confirmation (reliable level)
+   // Weak   = swing with no BOS = price will likely return and sweep it
+   //================================================================
+   a.hasWeakHigh = false; a.weakHigh  = 0;
+   a.hasWeakLow  = false; a.weakLow   = 0;
+   a.strongHigh  = 0;     a.strongLow = 0;
+   {
+      int swHL = MathMin(lookback, 40);
+      for(int i = 3; i < swHL - 3; i++) {
+         // Swing high at bar i
+         if(high[i] > high[i-1] && high[i] > high[i-2] &&
+            high[i] > high[i+1] && high[i] > high[i+2]) {
+            // BOS down from this high = strong (a lower low broke below a prior low)
+            double refLow = low[ArrayMinimum(low, i+1, MathMin(10, swHL-i-1))];
+            bool   bosDown = false;
+            for(int j = 1; j < i; j++) {
+               if(close[j] < refLow) { bosDown = true; break; }
+            }
+            if(bosDown) { if(high[i] > a.strongHigh) a.strongHigh = high[i]; }
+            else {
+               a.hasWeakHigh = true;
+               if(high[i] > a.weakHigh) a.weakHigh = high[i];
+            }
+         }
+         // Swing low at bar i
+         if(low[i] < low[i-1] && low[i] < low[i-2] &&
+            low[i] < low[i+1] && low[i] < low[i+2]) {
+            double refHigh = high[ArrayMaximum(high, i+1, MathMin(10, swHL-i-1))];
+            bool   bosUp   = false;
+            for(int j = 1; j < i; j++) {
+               if(close[j] > refHigh) { bosUp = true; break; }
+            }
+            if(bosUp) { if(a.strongLow == 0 || low[i] < a.strongLow) a.strongLow = low[i]; }
+            else {
+               a.hasWeakLow = true;
+               if(a.weakLow == 0 || low[i] < a.weakLow) a.weakLow = low[i];
+            }
+         }
+      }
+   }
 
    //================================================================
    // BUILD NARRATIVES
@@ -516,65 +770,76 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    string dir  = a.bullish ? "BULLISH" : "BEARISH";
    string zone = a.inDiscount ? "Discount" : (a.inPremium ? "Premium" : "Equilibrium");
 
-   // Structure narrative
    a.structureNarrative = StringFormat(
-      "%s | %s | ExtBOS:%s | IntBOS:%s | CHoCH:%s | MSS:%s | Disp:%s",
+      "%s | %s | ExtBOS:%s | CHoCH:%s | MSS:%s | Disp:%s | PO3:%s",
       dir, zone,
       a.hasExternalBOS  ? "Y" : "N",
-      a.hasInternalBOS  ? "Y" : "N",
       a.hasCHoCH        ? "Y" : "N",
       a.hasMSS          ? "Y" : "N",
-      a.hasDisplacement ? "Y" : "N");
+      a.hasDisplacement ? "Y" : "N",
+      a.po3Phase);
 
-   // OB / FVG narrative
-   string obStr  = a.hasFreshOB     ? StringFormat("FreshOB(%.2f-%.2f)", a.obLow, a.obHigh) :
-                   a.hasBreakerBlock ? "BreakerBlk" :
-                   a.hasMitigatedOB  ? "OB-Mitigated" : "NoOB";
-   string fvgStr = a.hasFVGOpen     ? StringFormat("OpenFVG(%.2f-%.2f)", a.fvgLow, a.fvgHigh) :
-                   a.hasInverseFVG   ? "InvFVG" :
-                   a.hasFVGClosed    ? "FVG-Closed" : "NoFVG";
+   string obStr  = a.hasFreshOB      ? StringFormat("FreshOB(%.2f-%.2f)", a.obLow, a.obHigh) :
+                   a.hasBreakerBlock  ? "BreakerBlk" :
+                   a.hasMitigatedOB   ? "OB-Mitigated" : "NoOB";
+   string fvgStr = a.hasBPR          ? StringFormat("BPR(%.2f-%.2f)", a.bprLow, a.bprHigh) :
+                   a.hasFVGOpen       ? StringFormat("FVG(%.2f CE:%.2f)", a.fvgLow, a.ceLevel) :
+                   a.hasInverseFVG    ? "InvFVG" :
+                   a.hasFVGClosed     ? "FVG-Closed" : "NoFVG";
 
-   // Liquidity narrative
    a.liquidityNarrative = StringFormat(
-      "%s | %s | Sweep:%s | EqH:%s | EqL:%s | OTE:%s",
+      "%s | %s | Sweep:%s | OTE:%s | WkHi:%s | WkLo:%s",
       obStr, fvgStr,
       a.hasLiqSweep   ? "Y" : "N",
-      a.hasEqualHighs ? StringFormat("Y@%.2f", a.equalHighLevel) : "N",
-      a.hasEqualLows  ? StringFormat("Y@%.2f", a.equalLowLevel)  : "N",
-      a.inOTE         ? "IN" : "N");
+      a.inOTE         ? "IN" : "N",
+      a.hasWeakHigh   ? StringFormat("Y@%.2f", a.weakHigh) : "N",
+      a.hasWeakLow    ? StringFormat("Y@%.2f", a.weakLow)  : "N");
 
-   // S&R narrative
    a.srNarrative = StringFormat(
-      "W:%.2f/%.2f | D:%.2f/%.2f | Asia:%.2f/%.2f | NearSR:%.2f%s",
-      a.weeklyHigh, a.weeklyLow,
-      a.dailyHigh,  a.dailyLow,
-      a.asianHigh,  a.asianLow,
-      a.nearestSR,  a.atKeySR ? " ← AT SR" : "");
+      "KZ:%s | %s | MidOpen:%.2f | IPDA20:%.2f-%.2f | W:%.2f/%.2f",
+      a.killzoneName,
+      a.inICTMacro    ? StringFormat("MACRO:%s", a.macroName) : "No Macro",
+      a.midnightOpen,
+      a.ipda20Low, a.ipda20High,
+      a.weeklyHigh, a.weeklyLow);
 
    a.narrative = a.structureNarrative;
 
    //================================================================
-   // SCORE THIS TIMEFRAME
+   // SCORE THIS TIMEFRAME (max ~42 base + ~18 ICT = ~60 total)
    //================================================================
    a.score = 0;
-   if(a.hasExternalBOS)   a.score += 3;
-   if(a.hasInternalBOS)   a.score += 1;
-   if(a.hasCHoCH)         a.score += 2;
-   if(a.hasMSS)           a.score += 3; // Stronger than CHoCH
-   if(a.hasDisplacement)  a.score += 2;
-   if(a.hasFreshOB)       a.score += 3;
-   if(a.hasBreakerBlock)  a.score += 2;
-   if(a.hasFVGOpen)       a.score += 2;
-   if(a.hasVolumeImbalance) a.score += 1;
-   if(a.hasLiqSweep)      a.score += 3;
+   // --- Base SMC (max 30) ---
+   if(a.hasExternalBOS)              a.score += 3;
+   if(a.hasInternalBOS)              a.score += 1;
+   if(a.hasCHoCH)                    a.score += 2;
+   if(a.hasMSS)                      a.score += 3;
+   if(a.hasDisplacement)             a.score += 2;
+   if(a.hasFreshOB)                  a.score += 3;
+   if(a.hasBreakerBlock)             a.score += 2;
+   if(a.hasFVGOpen)                  a.score += 2;
+   if(a.hasVolumeImbalance)          a.score += 1;
+   if(a.hasLiqSweep)                 a.score += 3;
    if(a.hasEqualHighs || a.hasEqualLows) a.score += 2;
-   if(a.inOTE)            a.score += 2;
-   if(a.atKeySR)          a.score += 2;
-   if(a.isJudasSwing)     a.score += 2;
-   if(a.inSilverBullet)   a.score += 1;
-   if(a.hasInducement)    a.score += 1;
-   if(a.hasMitigatedOB)   a.score -= 2; // Penalty for weak OB
-   if(a.hasFVGClosed)     a.score -= 1; // Penalty for closed FVG
+   if(a.inOTE)                       a.score += 2;
+   if(a.atKeySR)                     a.score += 2;
+   if(a.hasInducement)               a.score += 1;
+   if(a.isJudasSwing)                a.score += 2;
+   if(a.inSilverBullet)              a.score += 1;
+   // --- ICT Advanced (max 18) ---
+   if(a.inLondonKZ || a.inNYAmKZ)    a.score += 3;  // In major killzone
+   if(a.inICTMacro)                   a.score += 3;  // In ICT macro window
+   if(a.po3Distribution)              a.score += 3;  // PO3 distribution phase
+   if(a.atCE)                         a.score += 2;  // At consequent encroachment
+   if(a.hasBPR)                       a.score += 2;  // Balanced price range
+   if(a.atIPDALevel)                  a.score += 2;  // At IPDA boundary
+   if(a.nearMidnightOpen)             a.score += 2;  // Near NY midnight open
+   if(a.hasNDOG || a.hasNWOG)        a.score += 1;  // Opening gap present
+   if(a.hasWeakHigh && !a.bullish)    a.score += 1;  // Weak high = sweep target above
+   if(a.hasWeakLow  &&  a.bullish)    a.score += 1;  // Weak low  = sweep target below
+   // --- Penalties ---
+   if(a.hasMitigatedOB && !a.hasFreshOB) a.score -= 2;
+   if(a.hasFVGClosed   && !a.hasFVGOpen) a.score -= 1;
 
    return a;
 }
@@ -671,6 +936,18 @@ int ScorePrimaryAdvanced(SMCAnalysis &h4, SMCAnalysis &h1, SMCAnalysis &m15) {
    if(m15.isJudasSwing)                               score += 2;
    if(m15.inSilverBullet)                             score += 1;
 
+   // ICT Advanced Bonuses — Primary (max +18)
+   if(m15.inLondonKZ || m15.inNYAmKZ)              score += 3; // Prime killzone
+   if(m15.inICTMacro)                               score += 3; // ICT macro window
+   if(m15.po3Distribution)                          score += 3; // PO3 distribution phase
+   if(m15.atCE)                                     score += 2; // Consequent encroachment
+   if(h1.hasBPR)                                    score += 2; // Balanced price range
+   if(h4.atIPDALevel)                               score += 2; // IPDA price delivery level
+   if(m15.nearMidnightOpen)                         score += 1; // Near NY midnight open
+   if(h1.hasNDOG || h4.hasNWOG)                   score += 1; // Gap present (NDOG/NWOG)
+   if(m15.hasWeakLow  &&  h4.bullish)              score += 1; // Weak low as bull target
+   if(m15.hasWeakHigh && !h4.bullish)              score += 1; // Weak high as bear target
+
    // Penalties
    if(h4.hasMitigatedOB && !h4.hasFreshOB)            score -= 3;
    if(h1.hasFVGClosed    && !h1.hasFVGOpen)            score -= 2;
@@ -701,6 +978,18 @@ int ScoreFallbackAdvanced(SMCAnalysis &h1, SMCAnalysis &m15, SMCAnalysis &m5) {
    if(m5.hasCHoCH || m5.hasMSS)                        score += 3;
    if(m5.hasFVGOpen)                                    score += 2;
    if(m5.hasDisplacement)                               score += 2;
+
+   // ICT Advanced Bonuses — Fallback (max +18)
+   if(m5.inLondonKZ || m5.inNYAmKZ)                score += 3;
+   if(m5.inICTMacro)                                score += 3;
+   if(m5.po3Distribution)                           score += 3;
+   if(m5.atCE)                                      score += 2;
+   if(m15.hasBPR)                                   score += 2;
+   if(h1.atIPDALevel)                               score += 2;
+   if(m5.nearMidnightOpen)                          score += 1;
+   if(m15.hasNDOG || h1.hasNWOG)                  score += 1;
+   if(m5.hasWeakLow  &&  h1.bullish)               score += 1;
+   if(m5.hasWeakHigh && !h1.bullish)               score += 1;
 
    if(h1.hasMitigatedOB && !h1.hasFreshOB)             score -= 3;
    if(m15.hasFVGClosed   && !m15.hasFVGOpen)           score -= 2;
@@ -737,6 +1026,18 @@ int ScoreTertiaryAdvanced(SMCAnalysis &m15, SMCAnalysis &m5, SMCAnalysis &m1) {
    if(m1.hasFVGOpen)                                     score += 2;
    if(m1.hasFreshOB)                                     score += 1;
    if(m1.inSilverBullet)                                 score += 1;
+
+   // ICT Advanced Bonuses — Tertiary (max +18)
+   if(m1.inLondonKZ || m1.inNYAmKZ)                score += 3;
+   if(m1.inICTMacro)                                score += 3;
+   if(m1.po3Distribution)                           score += 3;
+   if(m1.atCE)                                      score += 2;
+   if(m5.hasBPR)                                    score += 2;
+   if(m15.atIPDALevel)                              score += 2;
+   if(m1.nearMidnightOpen)                          score += 1;
+   if(m5.hasNDOG)                                   score += 1;
+   if(m1.hasWeakLow  &&  m15.bullish)              score += 1;
+   if(m1.hasWeakHigh && !m15.bullish)              score += 1;
 
    // Penalties
    if(m15.hasMitigatedOB && !m15.hasFreshOB)             score -= 3;

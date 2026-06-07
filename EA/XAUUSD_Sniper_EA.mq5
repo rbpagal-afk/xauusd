@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.00"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.0"
+#property version     "13.60"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.6"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -123,6 +123,18 @@ input int              ScaledScore1      = 8;      // Score threshold for 1 entr
 input int              ScaledScore2      = 9;      // Score threshold for 2 simultaneous entries
 input int              ScaledScore3      = 10;     // Score threshold for 3 simultaneous entries
 
+input group            "=== ICT ADVANCED CONCEPTS ==="
+input bool             UseKillzones      = true;   // Score bonus for London/NY killzones
+input bool             UseICTMacros      = true;   // Score bonus for ICT macro windows
+input bool             UsePowerOf3       = true;   // Score bonus for PO3 distribution phase
+input bool             UseIPDA           = true;   // Score bonus for IPDA price delivery levels
+input bool             UseBPR            = true;   // Score bonus for Balanced Price Range
+input bool             UseCE             = true;   // Score bonus for Consequent Encroachment
+input bool             UseSMTDivergence  = true;   // Use SMT divergence (Gold vs DXY) as filter
+input string           SMT_Symbol        = "USDX"; // DXY symbol for SMT divergence (same as DXY)
+input bool             UseMidnightOpen   = true;   // Score bonus for NY midnight open proximity
+input bool             UseGapDetection   = true;   // Score bonus for NDOG/NWOG gap detection
+
 input group            "=== CHART VISUALS ==="
 input bool             ShowOB            = true;   // Draw Order Block boxes on chart
 input bool             ShowFVG           = true;   // Draw FVG zones on chart
@@ -213,6 +225,8 @@ string     g_Recommendation = "";
 bool       g_UseFallback    = false;
 bool       g_UseTertiary    = false;
 datetime   g_LastUpdate     = 0;
+bool       g_SMTDivergence  = false;  // SMT divergence detected (Gold vs DXY)
+string     g_SMTType        = "";     // "BULL" = Gold weak/DXY strong, "BEAR" = Gold strong/DXY weak
 
 //--- Capital protection state per ticket
 struct TradeState {
@@ -686,6 +700,64 @@ void UpdateDXY() {
       // Ranging DXY — no strong signal, allow both directions
       g_DXY_Bullish = false;
       g_DXY_Status  = StringFormat("RANGING %.3f | Neutral for gold", g_DXY_Change);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SMT Divergence — Gold vs DXY on H1 (last 3 swings)            |
+//| Divergence = Gold makes new high BUT DXY also makes new high   |
+//|   → expect Gold reversal down (bearish SMT)                    |
+//| Divergence = Gold makes new low BUT DXY also makes new low     |
+//|   → expect Gold reversal up (bullish SMT)                      |
+//+------------------------------------------------------------------+
+void CheckSMTDivergence() {
+   g_SMTDivergence = false;
+   g_SMTType       = "";
+
+   string dxySym = (StringLen(SMT_Symbol) > 0) ? SMT_Symbol : DXY_Symbol;
+   if(!SymbolSelect(dxySym, true)) return;
+
+   int lookback = 10;
+   double xauH[], xauL[], dxyH[], dxyL[];
+   ArraySetAsSeries(xauH, true); ArraySetAsSeries(xauL, true);
+   ArraySetAsSeries(dxyH, true); ArraySetAsSeries(dxyL, true);
+
+   if(CopyHigh(_Symbol, PERIOD_H1, 0, lookback, xauH) < lookback) return;
+   if(CopyLow (_Symbol, PERIOD_H1, 0, lookback, xauL) < lookback) return;
+   if(CopyHigh(dxySym,  PERIOD_H1, 0, lookback, dxyH) < lookback) return;
+   if(CopyLow (dxySym,  PERIOD_H1, 0, lookback, dxyL) < lookback) return;
+
+   // Compare recent 3-bar high vs prior 3-bar high
+   double xauRecHigh = MathMax(xauH[0], MathMax(xauH[1], xauH[2]));
+   double xauPriorHigh = MathMax(xauH[4], MathMax(xauH[5], xauH[6]));
+   double dxyRecHigh = MathMax(dxyH[0], MathMax(dxyH[1], dxyH[2]));
+   double dxyPriorHigh = MathMax(dxyH[4], MathMax(dxyH[5], dxyH[6]));
+
+   double xauRecLow = MathMin(xauL[0], MathMin(xauL[1], xauL[2]));
+   double xauPriorLow = MathMin(xauL[4], MathMin(xauL[5], xauL[6]));
+   double dxyRecLow = MathMin(dxyL[0], MathMin(dxyL[1], dxyL[2]));
+   double dxyPriorLow = MathMin(dxyL[4], MathMin(dxyL[5], dxyL[6]));
+
+   // Bearish SMT: Gold higher high + DXY higher high → Gold is overextended, reversal down
+   if(xauRecHigh > xauPriorHigh && dxyRecHigh > dxyPriorHigh) {
+      g_SMTDivergence = true;
+      g_SMTType = "BEAR"; // Both making higher highs — unusual, watch for Gold reversal
+   }
+   // Bullish SMT: Gold lower low + DXY lower low → watch for Gold reversal up
+   else if(xauRecLow < xauPriorLow && dxyRecLow < dxyPriorLow) {
+      g_SMTDivergence = true;
+      g_SMTType = "BULL";
+   }
+   // Classic bearish divergence: Gold higher high + DXY lower high (DXY weakening)
+   // → Gold well-supported — actually confirms BUY, not divergence in harmful sense
+   // Classic bearish divergence: Gold lower low + DXY higher low → SELL confirmation
+   else if(xauRecLow < xauPriorLow && dxyRecLow > dxyPriorLow) {
+      g_SMTDivergence = true;
+      g_SMTType = "BEAR_CONFIRM"; // DXY strengthening while gold falling = bearish
+   }
+   else if(xauRecHigh > xauPriorHigh && dxyRecHigh < dxyPriorHigh) {
+      g_SMTDivergence = true;
+      g_SMTType = "BULL_CONFIRM"; // DXY weakening while gold rising = bullish
    }
 }
 
@@ -1535,6 +1607,49 @@ void AnalyzeAllTimeframes() {
    g_PrimaryScore   = ScorePrimaryAdvanced(g_H4, g_H1, g_M15);
    g_FallbackScore  = ScoreFallbackAdvanced(g_H1, g_M15, g_M5);
    g_TertiaryScore  = ScoreTertiaryAdvanced(g_M15, g_M5, g_M1);
+
+   // ICT filter overrides: disable bonuses if their input toggle is off
+   if(!UseKillzones) {
+      g_H4.inLondonKZ=false; g_H4.inNYAmKZ=false;
+      g_H1.inLondonKZ=false; g_H1.inNYAmKZ=false;
+      g_M15.inLondonKZ=false; g_M15.inNYAmKZ=false;
+      g_M5.inLondonKZ=false; g_M5.inNYAmKZ=false;
+      g_M1.inLondonKZ=false; g_M1.inNYAmKZ=false;
+   }
+   if(!UseICTMacros) {
+      g_H4.inICTMacro=false; g_H1.inICTMacro=false;
+      g_M15.inICTMacro=false; g_M5.inICTMacro=false; g_M1.inICTMacro=false;
+   }
+   if(!UsePowerOf3) {
+      g_H4.po3Distribution=false; g_H1.po3Distribution=false;
+      g_M15.po3Distribution=false; g_M5.po3Distribution=false; g_M1.po3Distribution=false;
+   }
+   if(!UseIPDA) {
+      g_H4.atIPDALevel=false; g_H1.atIPDALevel=false;
+      g_M15.atIPDALevel=false; g_M5.atIPDALevel=false; g_M1.atIPDALevel=false;
+   }
+   if(!UseBPR) {
+      g_H4.hasBPR=false; g_H1.hasBPR=false;
+      g_M15.hasBPR=false; g_M5.hasBPR=false; g_M1.hasBPR=false;
+   }
+   if(!UseCE) {
+      g_H4.atCE=false; g_H1.atCE=false;
+      g_M15.atCE=false; g_M5.atCE=false; g_M1.atCE=false;
+   }
+   if(!UseMidnightOpen) {
+      g_H4.nearMidnightOpen=false; g_H1.nearMidnightOpen=false;
+      g_M15.nearMidnightOpen=false; g_M5.nearMidnightOpen=false; g_M1.nearMidnightOpen=false;
+   }
+   if(!UseGapDetection) {
+      g_H4.hasNDOG=false; g_H4.hasNWOG=false;
+      g_H1.hasNDOG=false; g_H1.hasNWOG=false;
+      g_M15.hasNDOG=false; g_M5.hasNDOG=false; g_M1.hasNDOG=false;
+   }
+
+   // SMT Divergence check (Gold vs DXY)
+   if(UseSMTDivergence) CheckSMTDivergence();
+   else { g_SMTDivergence = false; g_SMTType = ""; }
+
    g_Session        = GetSession();
 
    int effPrim = UseAdaptiveLearning ? g_DynPrimaryScore  : MinPrimaryScore;
@@ -1692,6 +1807,10 @@ void WriteStatusFile() {
    FileWriteString(fh, StringFormat("block_reason=%s\n", g_BlockReason));
    FileWriteString(fh, StringFormat("news=%s\n",         g_NewsBlocked ? "BLOCKED" : "Clear"));
    FileWriteString(fh, StringFormat("dxy=%s\n",          g_DXY_Status));
+   FileWriteString(fh, StringFormat("killzone=%s\n",     g_M15.killzoneName != "" ? g_M15.killzoneName : "Outside KZ"));
+   FileWriteString(fh, StringFormat("po3=%s\n",          g_M15.po3Phase));
+   FileWriteString(fh, StringFormat("smt=%s\n",          g_SMTDivergence ? g_SMTType : "None"));
+   FileWriteString(fh, StringFormat("ict_macro=%s\n",    g_M15.inICTMacro ? g_M15.macroName : "No"));
    FileWriteString(fh, StringFormat("recommendation=%s\n", g_Recommendation));
    FileWriteString(fh, StringFormat("total_trades=%d\n", g_TotalTrades));
    FileWriteString(fh, StringFormat("win_rate=%.1f\n",   GetWinRate()));
@@ -1744,7 +1863,7 @@ void WriteBridgeSignal(bool isBuy, int score, string strategy,
       TimeToString(TimeCurrent(), TIME_DATE), phtH, dt.min));
    FileWriteString(fh, StringFormat("strategy=%s\n",    strategy));
    FileWriteString(fh, StringFormat("direction=%s\n",   isBuy ? "BUY" : "SELL"));
-   FileWriteString(fh, StringFormat("score=%d/42\n",    score));
+   FileWriteString(fh, StringFormat("score=%d/60\n",    score));
    FileWriteString(fh, StringFormat("session=%s\n",     g_Session));
 
    // H4 context
@@ -1777,6 +1896,22 @@ void WriteBridgeSignal(bool isBuy, int score, string strategy,
    FileWriteString(fh, StringFormat("m15_fvgopen=%s\n", g_M15.hasFVGOpen     ? "YES" : "NO"));
    FileWriteString(fh, StringFormat("m15_judas=%s\n",   g_M15.isJudasSwing   ? "YES" : "NO"));
    FileWriteString(fh, StringFormat("m15_silver=%s\n",  g_M15.inSilverBullet ? "YES" : "NO"));
+
+   // ICT Advanced
+   FileWriteString(fh, StringFormat("killzone=%s\n",    g_M15.killzoneName != "" ? g_M15.killzoneName : "Outside KZ"));
+   FileWriteString(fh, StringFormat("ict_macro=%s\n",   g_M15.inICTMacro ? g_M15.macroName : "No"));
+   FileWriteString(fh, StringFormat("po3_phase=%s\n",   g_M15.po3Phase));
+   FileWriteString(fh, StringFormat("midnight_open=%.2f|near:%s\n", g_M15.midnightOpen,
+                                    g_M15.nearMidnightOpen ? "YES" : "NO"));
+   FileWriteString(fh, StringFormat("ndog=%s\n",        g_H1.hasNDOG ? StringFormat("YES [%.2f-%.2f]",
+                                    g_H1.ndogLow, g_H1.ndogHigh) : "No"));
+   FileWriteString(fh, StringFormat("nwog=%s\n",        g_H4.hasNWOG ? StringFormat("YES [%.2f-%.2f]",
+                                    g_H4.nwogLow, g_H4.nwogHigh) : "No"));
+   FileWriteString(fh, StringFormat("ipda_level=%s\n",  g_H4.atIPDALevel ? "YES" : "No"));
+   FileWriteString(fh, StringFormat("bpr=%s\n",         g_H1.hasBPR ? StringFormat("YES [%.2f-%.2f]",
+                                    g_H1.bprLow, g_H1.bprHigh) : "No"));
+   FileWriteString(fh, StringFormat("ce_level=%s\n",    g_M15.atCE ? StringFormat("YES (%.2f)", g_M15.ceLevel) : "No"));
+   FileWriteString(fh, StringFormat("smt=%s\n",         g_SMTDivergence ? g_SMTType : "None"));
 
    // Filters
    FileWriteString(fh, StringFormat("dxy_status=%s\n",  g_DXY_Status));
@@ -2195,7 +2330,7 @@ string GetRecommendation() {
       double lots   = CalcLotSize(PrimaryRisk, 15.0);
       g_LastLotSize = lots;
       int    maxEnt = GetMaxEntriesForScore(g_PrimaryScore);
-      return StringFormat("▶ PRIMARY  (H4→H1→M15): %s | Score %d/42 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+      return StringFormat("▶ PRIMARY  (H4→H1→M15): %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
                           dir, g_PrimaryScore, PrimaryRisk, lots, openNow, maxEnt);
    }
 
@@ -2205,7 +2340,7 @@ string GetRecommendation() {
       double lots   = CalcLotSize(FallbackRisk, 10.0);
       g_LastLotSize = lots;
       int    maxEnt = GetMaxEntriesForScore(g_FallbackScore);
-      return StringFormat("▶ FALLBACK (H1→M15→M5): %s | Score %d/42 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+      return StringFormat("▶ FALLBACK (H1→M15→M5): %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
                           dir, g_FallbackScore, FallbackRisk, lots, openNow, maxEnt);
    }
 
@@ -2215,14 +2350,14 @@ string GetRecommendation() {
       double lots   = CalcLotSize(TertiaryRisk, 7.0);
       g_LastLotSize = lots;
       int    maxEnt = GetMaxEntriesForScore(g_TertiaryScore);
-      return StringFormat("▶ SCALP    (M15→M5→M1): %s | Score %d/42 | Risk %.1f%% | Lots %.2f | %d/%d trades",
+      return StringFormat("▶ SCALP    (M15→M5→M1): %s | Score %d/60 | Risk %.1f%% | Lots %.2f | %d/%d trades",
                           dir, g_TertiaryScore, TertiaryRisk, lots, openNow, maxEnt);
    }
 
    // No tier ready
    string scaleHint = UseScaledEntries ?
       StringFormat("  [Entries: score %d=1, %d=2, %d=3]", ScaledScore1, ScaledScore2, ScaledScore3) : "";
-   return StringFormat("NO TRADE — P:%d/42(≥%d) | F:%d/42(≥%d) | T:%d/42(≥%d)%s",
+   return StringFormat("NO TRADE — P:%d/60(≥%d) | F:%d/60(≥%d) | T:%d/60(≥%d)%s",
                        g_PrimaryScore, effPrim,
                        g_FallbackScore, effFall,
                        g_TertiaryScore, effTert, scaleHint);
@@ -2758,7 +2893,7 @@ void SendSignalNotification(string strategy, bool isBuy, int score,
                             double tp2, double lots, double riskPct) {
    string dir  = isBuy ? "BUY" : "SELL";
    string msg  = StringFormat(
-      "XAUUSD SNIPER | %s %s\nScore: %d/42 | %s\nEntry: %.2f\nSL: %.2f | TP1: %.2f | TP2: %.2f\nRisk: %.1f%% | Lots: %.2f",
+      "XAUUSD SNIPER | %s %s\nScore: %d/60 | %s\nEntry: %.2f\nSL: %.2f | TP1: %.2f | TP2: %.2f\nRisk: %.1f%% | Lots: %.2f",
       strategy, dir, score, g_Session,
       entry, sl, tp1, tp2, riskPct, lots);
 
@@ -2897,7 +3032,7 @@ void GenerateHTMLReport() {
    html += TR("Max Spread Pips",      StringFormat("%.1f",   MaxSpreadPips));
    html += "</table>";
 
-   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v13.0 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
+   html += "<br/><p style='color:#555;font-size:0.8em'>XAUUSD Sniper EA v13.6 — Advanced SMC Engine — Philippines Sniper Strategy</p>";
    html += "</body></html>";
 
    FileWriteString(fh, html);
@@ -3220,6 +3355,78 @@ void UpdateDashboard() {
       y += dy;
    }
    y += 4;
+
+   // ── ICT ADVANCED CONCEPTS ──
+   SetLabel(PREFIX+"ICTH", x, y, "── ICT ADVANCED CONCEPTS ──", ColorHeader, FontSize);
+   y += dy;
+
+   // Current TF data depending on which tier is active
+   SMCAnalysis &ict_ref = g_UseTertiary ? g_M1 : (g_UseFallback ? g_M5 : g_M15);
+   SMCAnalysis &ict_mid = g_UseTertiary ? g_M5 : (g_UseFallback ? g_M15 : g_H1);
+   SMCAnalysis &ict_htf = g_UseTertiary ? g_M15 : (g_UseFallback ? g_H1 : g_H4);
+
+   // Killzone & Macro
+   string kzStr = (ict_ref.killzoneName != "") ? ict_ref.killzoneName : "Outside Killzone";
+   string macroStr = ict_ref.inICTMacro ? ict_ref.macroName : "No Macro";
+   color kzClr = (ict_ref.inLondonKZ || ict_ref.inNYAmKZ) ? ColorBull :
+                 (ict_ref.inNYPMKZ || ict_ref.inAsianKZ)   ? ColorWarn : ColorNeutral;
+   SetLabel(PREFIX+"ICT1", x, y,
+            StringFormat("Killzone: %-22s  |  Macro: %s",
+                         (UseKillzones ? kzStr : "OFF"), (UseICTMacros ? macroStr : "OFF")),
+            kzClr, FontSize);
+   y += dy;
+
+   // Power of 3
+   string po3Str = g_M15.po3Phase != "" ? g_M15.po3Phase : "Undetermined";
+   color po3Clr = g_M15.po3Distribution ? ColorBull :
+                  g_M15.po3Manipulation ? ColorWarn : ColorNeutral;
+   SetLabel(PREFIX+"ICT2", x, y,
+            StringFormat("PO3 Phase: %-20s  |  CE: %s  |  Near MN Open: %s",
+                         (UsePowerOf3 ? po3Str : "OFF"),
+                         (UseCE ? (ict_ref.atCE ? StringFormat("YES (%.2f)", ict_ref.ceLevel) : "No") : "OFF"),
+                         (UseMidnightOpen ? (ict_ref.nearMidnightOpen ? StringFormat("YES (%.2f)", ict_ref.midnightOpen) : "No") : "OFF")),
+            po3Clr, FontSize);
+   y += dy;
+
+   // IPDA & BPR
+   string ipdaStr = ict_htf.atIPDALevel ? StringFormat("YES (20:%d 40:%d 60:%d)",
+                       (int)ict_htf.ipda20High, (int)ict_htf.ipda40High, (int)ict_htf.ipda60High) : "Not at level";
+   string bprStr  = ict_mid.hasBPR ? StringFormat("YES [%.2f–%.2f]", ict_mid.bprLow, ict_mid.bprHigh) : "No";
+   SetLabel(PREFIX+"ICT3", x, y,
+            StringFormat("IPDA: %-30s  |  BPR: %s",
+                         (UseIPDA ? ipdaStr : "OFF"), (UseBPR ? bprStr : "OFF")),
+            (ict_htf.atIPDALevel ? ColorBull : ColorNeutral), FontSize);
+   y += dy;
+
+   // NDOG / NWOG
+   string ndogStr = g_H1.hasNDOG ? StringFormat("YES [%.2f–%.2f]", g_H1.ndogLow, g_H1.ndogHigh) : "No gap";
+   string nwogStr = g_H4.hasNWOG ? StringFormat("YES [%.2f–%.2f]", g_H4.nwogLow, g_H4.nwogHigh) : "No gap";
+   SetLabel(PREFIX+"ICT4", x, y,
+            StringFormat("NDOG: %-30s  |  NWOG: %s",
+                         (UseGapDetection ? ndogStr : "OFF"), (UseGapDetection ? nwogStr : "OFF")),
+            ((g_H1.hasNDOG || g_H4.hasNWOG) ? ColorWarn : ColorNeutral), FontSize);
+   y += dy;
+
+   // Strong / Weak H/L
+   string swStr = "";
+   if(ict_ref.hasWeakHigh)  swStr += StringFormat("Weak H:%.2f  ", ict_ref.weakHigh);
+   if(ict_ref.hasWeakLow)   swStr += StringFormat("Weak L:%.2f  ", ict_ref.weakLow);
+   if(StringLen(swStr) == 0) swStr = "No weak structures";
+   SetLabel(PREFIX+"ICT5", x, y,
+            StringFormat("Strong/Weak H/L: %-40s", swStr),
+            (ict_ref.hasWeakHigh || ict_ref.hasWeakLow) ? ColorWarn : ColorNeutral, FontSize);
+   y += dy;
+
+   // SMT Divergence
+   string smtStr = !UseSMTDivergence ? "OFF" :
+                   !g_SMTDivergence  ? StringFormat("None detected (%s vs %s)", _Symbol, SMT_Symbol) :
+                   StringFormat("DETECTED: %s — %s vs %s", g_SMTType, _Symbol, SMT_Symbol);
+   color smtClr = !UseSMTDivergence ? ColorNeutral :
+                  !g_SMTDivergence  ? ColorText :
+                  (g_SMTType == "BULL_CONFIRM") ? ColorBull :
+                  (g_SMTType == "BEAR_CONFIRM") ? ColorBear : ColorWarn;
+   SetLabel(PREFIX+"ICT6", x, y, StringFormat("SMT Divergence: %s", smtStr), smtClr, FontSize);
+   y += dy + 4;
 
    // ── CLAUDE AI BRIDGE ──
    SetLabel(PREFIX+"BRH", x, y, "── CLAUDE AI BRIDGE ──", ColorHeader, FontSize);
@@ -3647,7 +3854,7 @@ void UpdateDashboard() {
 
    y += 4;
    SetLabel(PREFIX+"UPD", x, y,
-            StringFormat("v13.0 | %s | Magic: %d | %s",
+            StringFormat("v13.6 | %s | Magic: %d | %s",
                          TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS),
                          MagicNumber,
                          g_IsTesting ? "STRATEGY TESTER MODE" : "LIVE MODE"),
