@@ -1330,7 +1330,7 @@ void TryAutoEntry() {
    if(isAsian || isPremarket) {
       double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
       double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
-                         SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 0.1;
+                         SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
       if(curSpread > AsianMaxSpread) {
          g_EntryLog = StringFormat("Asian KZ: Spread %.1f pips > max %.1f — waiting", curSpread, AsianMaxSpread);
          return;
@@ -1411,9 +1411,10 @@ void TryAutoEntry() {
    }
 
    // ── PER-SESSION RISK & TP OVERRIDES ──
+   // Cap tier risk at session's maximum — never exceed session limit
    double effectiveTP1_RR = sp.tp1RR;
    double effectiveTP2_RR = sp.tp2RR;
-   riskPct = sp.risk;
+   riskPct = MathMin(riskPct, sp.risk);  // Session caps tier risk (Asian 0.5% caps Primary 2%)
    if(StringLen(sp.tag) > 0) strategy += "_" + StringSubstr(sp.tag, 1, StringLen(sp.tag)-2);
 
    // ── SCALED ENTRY GATE — check how many trades are already open ──
@@ -1448,6 +1449,23 @@ void TryAutoEntry() {
 
       // If approved with SL adjustment — use Claude's SL
       // (applied below after SL calculation)
+   }
+
+   // ── SMT DIVERGENCE CHECK ──
+   // BULL_CONFIRM = DXY weakening + Gold rising = confirms BUY
+   // BEAR_CONFIRM = DXY strengthening + Gold falling = confirms SELL
+   // BULL/BEAR (non-confirm) = unusual co-movement = warn but don't block
+   if(UseSMTDivergence && g_SMTDivergence) {
+      bool smtContradict = (isBuy  && g_SMTType == "BEAR_CONFIRM") ||
+                           (!isBuy && g_SMTType == "BULL_CONFIRM");
+      bool smtConfirm    = (isBuy  && g_SMTType == "BULL_CONFIRM") ||
+                           (!isBuy && g_SMTType == "BEAR_CONFIRM");
+      if(smtContradict) {
+         g_EntryLog = StringFormat("SMT BLOCKED: %s trade contradicted by SMT (%s) — Gold vs %s",
+                                   isBuy ? "BUY" : "SELL", g_SMTType, SMT_Symbol);
+         return;
+      }
+      if(smtConfirm) score += 2; // Small bonus — confirmed direction
    }
 
    // ── DXY CORRELATION CHECK ──
@@ -1495,6 +1513,7 @@ void TryAutoEntry() {
    double tp2    = isBuy ? entry + slPips * effectiveTP2_RR * pip : entry - slPips * effectiveTP2_RR * pip;
 
    sl  = NormalizeDouble(sl,  _Digits);
+   tp1 = NormalizeDouble(tp1, _Digits);
    tp2 = NormalizeDouble(tp2, _Digits);
 
    string comment = StringFormat("Sniper %s %s Sc:%d", strategy, isBuy?"BUY":"SELL", score);
@@ -1545,23 +1564,49 @@ void TryAutoEntry() {
    g_LastTP1RR = effectiveTP1_RR;
    g_LastTP2RR = effectiveTP2_RR;
 
-   bool ok = false;
-   if(isBuy)
-      ok = Trade.Buy(lots, _Symbol, ask, sl, tp2, comment);
-   else
-      ok = Trade.Sell(lots, _Symbol, bid, sl, tp2, comment);
+   // ── SCALED ENTRIES — execute up to maxAllowed trades ──
+   // Each entry staggers its TP2 slightly to avoid all closing at the same tick
+   int toPlace  = MathMax(1, MathMin(maxAllowed - openNow,
+                              UseScaledEntries ? maxAllowed - openNow : 1));
+   int placed   = 0;
+   int failed   = 0;
+   string ticketList = "";
 
-   if(ok) {
+   for(int ei = 0; ei < toPlace; ei++) {
+      // Stagger TP2 on 2nd and 3rd entries (+0.2 RR each) for independent targets
+      double entryTP2 = isBuy ? entry + slPips * (effectiveTP2_RR + ei * 0.2) * pip
+                               : entry - slPips * (effectiveTP2_RR + ei * 0.2) * pip;
+      entryTP2 = NormalizeDouble(entryTP2, _Digits);
+
+      string entryComment = StringFormat("Sniper %s %s Sc:%d E%d/%d",
+                                         strategy, isBuy?"BUY":"SELL", score,
+                                         ei + 1, toPlace);
+      bool ok = false;
+      if(isBuy)
+         ok = Trade.Buy(lots, _Symbol, ask, sl, entryTP2, entryComment);
+      else
+         ok = Trade.Sell(lots, _Symbol, bid, sl, entryTP2, entryComment);
+
+      if(ok) {
+         placed++;
+         ulong newTicket = Trade.ResultOrder();
+         ticketList += "#" + IntegerToString(newTicket) + " ";
+         if(UseAdaptiveLearning) RegisterSnapshot(newTicket, strategy);
+      } else {
+         failed++;
+      }
+   }
+
+   if(placed > 0) {
       g_LastEntryBar = currentBar;
-      ulong newTicket = Trade.ResultOrder();
-      g_EntryLog = StringFormat("ENTERED: %s %s | Score:%d | Entry:%.2f SL:%.2f TP2:%.2f | Lots:%.2f | #%d",
-                                strategy, isBuy?"BUY":"SELL", score,
-                                entry, sl, tp2, lots, newTicket);
-      // Capture confluence snapshot for learning
-      if(UseAdaptiveLearning) RegisterSnapshot(newTicket, strategy);
-   } else {
-      g_EntryLog = StringFormat("ENTRY FAILED: Error %d — %s",
-                                Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+      g_EntryLog = StringFormat("ENTERED %d/%d: %s %s | Score:%d | Entry:%.2f SL:%.2f TP2:%.2f | Lots:%.2f | %s",
+                                placed, toPlace, strategy, isBuy?"BUY":"SELL", score,
+                                entry, sl, tp2, lots, ticketList);
+   }
+   if(failed > 0) {
+      g_EntryLog += StringFormat(" | %d FAILED (Error %d: %s)",
+                                 failed, Trade.ResultRetcode(),
+                                 Trade.ResultRetcodeDescription());
    }
 }
 
@@ -2577,8 +2622,12 @@ void ResetWeeklyTracking() {
    TimeToStruct(TimeCurrent(), dt);
    // Find Monday of current week
    int wday = dt.day_of_week == 0 ? 6 : dt.day_of_week - 1;
-   g_WeekStart = TimeCurrent() - wday * 86400 -
-                 (dt.hour * 3600 + dt.min * 60 + dt.sec);
+   // Snap to Monday midnight PHT (UTC+8) = Sunday 16:00 UTC
+   datetime nowUTC  = TimeCurrent();
+   g_WeekStart = nowUTC - wday * 86400 -
+                 (dt.hour * 3600 + dt.min * 60 + dt.sec) + 8 * 3600;
+   // If offset pushed past today, go back one day
+   if(g_WeekStart > nowUTC) g_WeekStart -= 86400;
 }
 
 void ResetMonthlyTracking() {
@@ -2596,8 +2645,10 @@ void CheckNewWeek() {
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int wday    = dt.day_of_week == 0 ? 6 : dt.day_of_week - 1;
-   datetime monDay = TimeCurrent() - wday * 86400 -
-                     (dt.hour * 3600 + dt.min * 60 + dt.sec);
+   datetime nowUTC2 = TimeCurrent();
+   datetime monDay = nowUTC2 - wday * 86400 -
+                     (dt.hour * 3600 + dt.min * 60 + dt.sec) + 8 * 3600;
+   if(monDay > nowUTC2) monDay -= 86400;
    if(monDay != g_WeekStart) {
       g_WeekStart       = monDay;
       g_SessionCloseDone = false;

@@ -300,7 +300,7 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
       for(int i = 1; i <= 5; i++) {
          double body = MathAbs(close[i] - open[i]);
          double range= high[i] - low[i];
-         if(range > 0 && body / range > 0.7 && body > pip * 5) {
+         if(range > 0 && body / range > 0.7 && body > pip * 3) {
             a.hasMSS = true;
             break;
          }
@@ -547,7 +547,8 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    MqlDateTime dt;
    TimeToStruct(TimeGMT(), dt);
    int phtHour = (dt.hour + 8) % 24;
-   bool atSessionOpen = (phtHour == 15 || phtHour == 20);
+   bool atSessionOpen = (phtHour >= 15 && phtHour < 17) || // London open window
+                        (phtHour >= 20 && phtHour < 22);   // NY open window
    if(atSessionOpen && a.hasLiqSweep && a.hasCHoCH)
       a.isJudasSwing = true;
 
@@ -863,13 +864,14 @@ void ComputeAsianRange(string symbol, SMCAnalysis &a) {
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
    int copied = CopyRates(symbol, PERIOD_M15, asianStart, asianEnd, rates);
-   if(copied <= 0) { a.asianLow = 0; return; }
+   if(copied <= 0) { a.asianHigh = 0; a.asianLow = 0; return; }
 
-   for(int i = 0; i < copied; i++) {
+   a.asianHigh = rates[0].high;
+   a.asianLow  = rates[0].low;
+   for(int i = 1; i < copied; i++) {
       if(rates[i].high > a.asianHigh) a.asianHigh = rates[i].high;
       if(rates[i].low  < a.asianLow)  a.asianLow  = rates[i].low;
    }
-   if(a.asianLow == DBL_MAX) a.asianLow = 0;
 }
 
 //+------------------------------------------------------------------+
