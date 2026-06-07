@@ -1788,7 +1788,8 @@ void TryAutoEntry() {
    // Bypass in Asian/Pre-market (range fade at extremes already checked above).
    if(curSessIdx != SESS_ASIAN && curSessIdx != SESS_PREMARKET) {
       bool atZone = false;
-      SMCAnalysis &ref = (primaryReady ? g_H1 : (fallbackReady ? g_M15 : g_M5));
+      SMCAnalysis *ref_ptr = primaryReady ? &g_H1 : (fallbackReady ? &g_M15 : &g_M5);
+      SMCAnalysis ref = ref_ptr[0];
       atZone = atZone || ref.inOTE;           // Price in 61.8-79% retracement
       atZone = atZone || ref.atCE;            // At FVG midpoint (CE)
       atZone = atZone || (ref.hasFreshOB &&
@@ -1978,7 +1979,8 @@ void TryAutoEntry() {
    // If enabled: price approaching FVG but not yet inside → place BUY/SELL LIMIT at CE.
    // If price is already inside FVG → fall back to market order (immediate execution).
    if(UsePendingOrders) {
-      SMCAnalysis &fvgRef = (primaryReady ? g_H1 : (fallbackReady ? g_M15 : g_M5));
+      SMCAnalysis *fvgRef_ptr = primaryReady ? &g_H1 : (fallbackReady ? &g_M15 : &g_M5);
+      SMCAnalysis fvgRef = fvgRef_ptr[0];
       bool hasFVG      = fvgRef.hasFVGOpen && fvgRef.fvgHigh > 0 && fvgRef.fvgLow > 0;
       bool insideFVG   = hasFVG && ask >= fvgRef.fvgLow && bid <= fvgRef.fvgHigh;
       bool approachFVG = hasFVG && !insideFVG &&
@@ -4411,9 +4413,12 @@ void UpdateDashboard() {
    y += dy;
 
    // Current TF data depending on which tier is active
-   SMCAnalysis &ict_ref = g_UseTertiary ? g_M1 : (g_UseFallback ? g_M5 : g_M15);
-   SMCAnalysis &ict_mid = g_UseTertiary ? g_M5 : (g_UseFallback ? g_M15 : g_H1);
-   SMCAnalysis &ict_htf = g_UseTertiary ? g_M15 : (g_UseFallback ? g_H1 : g_H4);
+   SMCAnalysis *ict_ref_ptr = g_UseTertiary ? &g_M1  : (g_UseFallback ? &g_M5  : &g_M15);
+   SMCAnalysis *ict_mid_ptr = g_UseTertiary ? &g_M5  : (g_UseFallback ? &g_M15 : &g_H1);
+   SMCAnalysis *ict_htf_ptr = g_UseTertiary ? &g_M15 : (g_UseFallback ? &g_H1  : &g_H4);
+   SMCAnalysis ict_ref = ict_ref_ptr[0];
+   SMCAnalysis ict_mid = ict_mid_ptr[0];
+   SMCAnalysis ict_htf = ict_htf_ptr[0];
 
    // Killzone & Macro
    string kzStr = (ict_ref.killzoneName != "") ? ict_ref.killzoneName : "Outside Killzone";
@@ -4851,13 +4856,13 @@ void UpdateDashboard() {
 
    string obStr    = ShowOB         ? "OB:ON"     : "OB:OFF";
    string fvgStr   = ShowFVG        ? "FVG:ON"    : "FVG:OFF";
-   string swStr    = ShowSweep      ? "Sweep:ON"  : "Sweep:OFF";
+   string cvSwStr  = ShowSweep      ? "Sweep:ON"  : "Sweep:OFF";
    string bosStr   = ShowBOSArrows  ? "BOS:ON"    : "BOS:OFF";
    string tlStr    = ShowTradeLevels ? "Levels:ON" : "Levels:OFF";
 
-   SetLabel(PREFIX+"CV1a", x,       y, obStr,  ShowOB          ? ColorBull : ColorNeutral, FontSize);
-   SetLabel(PREFIX+"CV1b", x + 75,  y, fvgStr, ShowFVG         ? ColorBull : ColorNeutral, FontSize);
-   SetLabel(PREFIX+"CV1c", x + 150, y, swStr,  ShowSweep       ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1a", x,       y, obStr,    ShowOB          ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1b", x + 75,  y, fvgStr,   ShowFVG         ? ColorBull : ColorNeutral, FontSize);
+   SetLabel(PREFIX+"CV1c", x + 150, y, cvSwStr,  ShowSweep       ? ColorBull : ColorNeutral, FontSize);
    SetLabel(PREFIX+"CV1d", x + 235, y, bosStr, ShowBOSArrows   ? ColorBull : ColorNeutral, FontSize);
    SetLabel(PREFIX+"CV1e", x + 310, y, tlStr,  ShowTradeLevels ? ColorBull : ColorNeutral, FontSize);
    y += dy;
