@@ -1674,12 +1674,21 @@ string GetSession() {
    // Convert UTC to PHT (+8)
    int pht = (hour + 8) % 24;
 
-   if(pht >= 8  && pht < 15)  return "Asian Session (Prepare Only)";
-   if(pht >= 15 && pht < 17)  return "London Open — TRADE WINDOW 1";
-   if(pht >= 17 && pht < 20)  return "London Session (Selective)";
-   if(pht >= 20 && pht < 22)  return "New York Open — TRADE WINDOW 2 (BEST)";
-   if(pht >= 22)               return "After Hours — Close Charts & Rest";
-   return "Pre-Market — Prepare Charts";
+   // PHT (UTC+8) session windows for gold trader in Philippines:
+   // Asian KZ:    05:00-07:00 PHT (21:00-23:00 UTC)
+   // Pre-market:  07:00-15:00 PHT — rest / prepare
+   // London Open: 15:00-17:00 PHT (07:00-09:00 UTC) ← TRADE WINDOW 1
+   // London Sess: 17:00-20:00 PHT (09:00-12:00 UTC) — selective
+   // NY Open:     20:00-23:00 PHT (12:00-15:00 UTC) ← BEST TRADE WINDOW
+   // NY PM Close: 23:00-01:00 PHT (15:00-17:00 UTC) — Silver Bullet / wind down
+   // NY Closed:   01:00-05:00 PHT — sleep
+   if(pht >= 5  && pht < 7)   return "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)";
+   if(pht >= 7  && pht < 15)  return "Pre-Market — Prepare Charts (Rest)";
+   if(pht >= 15 && pht < 17)  return "London Open — TRADE WINDOW 1 (3PM-5PM PHT)";
+   if(pht >= 17 && pht < 20)  return "London Session — Selective Trades (5PM-8PM PHT)";
+   if(pht >= 20 && pht < 23)  return "New York Open — BEST WINDOW (8PM-11PM PHT)";
+   if(pht >= 23 || pht < 1)   return "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)";
+   return "NY Closed — Sleep (1AM-5AM PHT)";
 }
 
 //+------------------------------------------------------------------+

@@ -552,9 +552,11 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
       a.isJudasSwing = true;
 
    //================================================================
-   // SILVER BULLET WINDOW (10:00-11:00 NY = 22:00-23:00 PHT)
+   // SILVER BULLET WINDOWS — 3AM, 10AM, 2PM NY = 15UTC, 22UTC, 2UTC
+   // In PHT (+8): 3AM NY=11PM PHT, 10AM NY=11PM PHT+1h, 2PM NY=3AM PHT
+   // Most active: 10AM NY = 15:00 UTC = 23:00 PHT
    //================================================================
-   a.inSilverBullet = (phtHour == 22);
+   a.inSilverBullet = (phtHour == 23 || phtHour == 3);
 
    //================================================================
    // REJECTION BLOCK / PROPULSION BLOCK
@@ -568,7 +570,7 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    int utcH = dt.hour;
    int utcM = dt.min;
    int utcT = utcH * 100 + utcM; // HHMM integer for range checks
-   a.inAsianKZ   = (utcT >= 2100 || utcT <  2300);
+   a.inAsianKZ   = (utcT >= 2100 && utcT <  2300);
    a.inLondonKZ  = (utcT >= 700  && utcT <   900);
    a.inNYAmKZ    = (utcT >= 1200 && utcT <  1500);
    a.inNYPMKZ    = (utcT >= 1500 && utcT <  1700);
@@ -584,11 +586,11 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    int macroStart[5] = {733, 903, 1350, 1510, 1650};
    int macroEnd[5]   = {800, 930, 1410, 1540, 1710};
    string macroLabels[5] = {
-      "London Macro (3:33-4:00 PHT)",
-      "London AM Macro (5:03-5:30 PHT)",
-      "NY Pre-Market Macro (9:50-10:10 PHT — 21:50 PHT)",
-      "NY AM Macro (11:10-11:40 PHT — 23:10 PHT)",
-      "Lunch Macro (12:50-1:10 PHT)"
+      "London Open Macro (3:33-4:00 PM PHT)",
+      "London AM Macro (5:03-5:30 PM PHT)",
+      "NY Lunch Macro (9:50-10:10 PM PHT)",
+      "NY AM Macro (11:10-11:40 PM PHT)",
+      "NY PM Macro (12:50-1:10 AM PHT)"
    };
    a.inICTMacro = false;
    a.macroName  = "";
