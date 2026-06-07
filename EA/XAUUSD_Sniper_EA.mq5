@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.12"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.12"
+#property version     "13.13"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.13"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -429,6 +429,7 @@ string     g_BlockReason       = "";     // Why trading is blocked
 //--- Auto entry state
 datetime   g_LastEntryBar      = 0;
 int        g_LastSignalScore   = 0;
+bool       g_LastSignalIsBuy   = false; // Track last alerted direction (re-alert on flip)
 double     g_LastTP1RR         = 1.0; // Effective TP1 RR used at entry (may differ in Asian session)
 double     g_LastTP2RR         = 3.0; // Effective TP2 RR used at entry
 bool       g_AlertSent         = false;
@@ -1509,9 +1510,11 @@ void TryAutoEntry() {
       }
    }
 
-   // ── DAILY BIAS LOCK — set after London Open confirms, gate NY Open ──
-   if(curSessIdx == SESS_LONDON_OPEN && !g_DailyBiasLocked) {
-      // Lock direction only when strong signal fires (H1 + M15 agree)
+   // ── DAILY BIAS LOCK — set after London Open / Pre-London confirms direction ──
+   // Pre-London spike often reveals the day's real direction before London even opens.
+   bool isLondonBiasSession = (curSessIdx == SESS_PRELONDON || curSessIdx == SESS_LONDON_OPEN);
+   if(isLondonBiasSession && !g_DailyBiasLocked) {
+      // Lock only when H1 + M15 agree (not just M15 noise)
       if(g_H1.bullish == g_M15.bullish) {
          g_DailyBias       = isBuy;
          g_DailyBiasLocked = true;
@@ -1543,105 +1546,130 @@ void TryAutoEntry() {
    }
 
    // ── PO3 PHASE SESSION GATE ──
-   // Accumulation phase → Asian/Pre-market only (range fade)
-   // Manipulation phase → London Open only (Judas reversal)
+   // Accumulation phase → only Asian/Pre-market/Pre-London range setups
+   // Manipulation phase → Judas reversal sessions (Pre-London, London Open, Pre-NY, NY Open)
    // Distribution phase → all sessions (trend follow)
-   if(g_M15.po3Accumulation && curSessIdx != SESS_ASIAN && curSessIdx != SESS_PREMARKET) {
-      // PO3 says we're still in range — don't trend-follow outside Asian
-      if(!g_M15.po3Manipulation && !g_M15.po3Distribution) {
-         g_EntryLog = "PO3 GATE: Accumulation phase — range trade only in Asian/Pre-market";
+   {
+      bool inAccumSession = (curSessIdx == SESS_ASIAN     || curSessIdx == SESS_PREMARKET ||
+                             curSessIdx == SESS_PRELONDON || curSessIdx == SESS_PRENY);
+      if(g_M15.po3Accumulation && !inAccumSession) {
+         g_EntryLog = "PO3 GATE: Accumulation phase — range/Judas setups only, no trend entries";
          return;
       }
    }
 
-   // ── PER-SESSION RISK & TP OVERRIDES ──
-   // Cap tier risk at session's maximum — never exceed session limit
-   double effectiveTP1_RR = sp.tp1RR;
-   double effectiveTP2_RR = sp.tp2RR;
-   riskPct = MathMin(riskPct, sp.risk);  // Session caps tier risk (Asian 0.5% caps Primary 2%)
-   if(StringLen(sp.tag) > 0) strategy += "_" + StringSubstr(sp.tag, 1, StringLen(sp.tag)-2);
+   // ── PRICE-AT-ZONE CHECK (Sniper Gate) ──
+   // For a true sniper entry, price must be AT a valid SMC entry zone, not just near one.
+   // At minimum: price in OTE zone, or at CE (FVG midpoint), or currently inside OB, or at IPDA level.
+   // Bypass in Asian/Pre-market (range fade at extremes already checked above).
+   if(curSessIdx != SESS_ASIAN && curSessIdx != SESS_PREMARKET) {
+      bool atZone = false;
+      SMCAnalysis &ref = (primaryReady ? g_H1 : (fallbackReady ? g_M15 : g_M5));
+      atZone = atZone || ref.inOTE;           // Price in 61.8-79% retracement
+      atZone = atZone || ref.atCE;            // At FVG midpoint (CE)
+      atZone = atZone || (ref.hasFreshOB &&
+                          StringFind(ref.obStatus, "In OB") >= 0); // Inside OB
+      atZone = atZone || ref.atIPDALevel;     // At IPDA 20/40/60 day boundary
+      atZone = atZone || g_M15.inOTE || g_M15.atCE;
+      if(!atZone) {
+         g_EntryLog = StringFormat("ZONE CHECK: Not at OTE/CE/OB/IPDA — waiting for pullback to entry zone (%s)",
+                                   strategy);
+         g_AlertSent = false;
+         return;
+      }
+   }
 
-   // ── SCALED ENTRY GATE — check how many trades are already open ──
-   int openNow    = CountOpenTrades();
-   int maxAllowed = GetMaxEntriesForScore(score);
-   if(maxAllowed == 0) {
-      g_EntryLog = StringFormat("SCALED: Score %d below entry threshold (need %d for 1 entry)",
-                                score, ScaledScore1);
+   // ── CANDLE CONFIRMATION CHECK — before expensive checks ──
+   if(!CheckCandleConfirmation(isBuy, entryTF)) {
+      g_EntryLog = StringFormat("CANDLE: Waiting for %s confirmation on %s",
+                                isBuy ? "bullish" : "bearish", TFToString(entryTF));
       g_AlertSent = false;
       return;
    }
-   if(openNow >= maxAllowed) {
-      g_EntryLog = StringFormat("SCALED: %d/%d trades open for score %d — waiting for close or higher score",
-                                openNow, maxAllowed, score);
-      return;
-   }
-
-   // ── BRIDGE STATE MACHINE ──
-   if(UseBridge) {
-      // If waiting for Claude response — check file or timeout
-      if(g_BridgeState == BRIDGE_WAITING) {
-         CheckBridgeTimeout();
-         if(!ReadBridgeResponse()) return; // Still waiting
-      }
-
-      // If Claude rejected — reset and skip this bar
-      if(g_BridgeState == BRIDGE_REJECTED) {
-         g_BridgeState = BRIDGE_IDLE;
-         g_EntryLog    = StringFormat("Claude SKIPPED: %s", g_BridgeReason);
-         return;
-      }
-
-      // If approved with SL adjustment — use Claude's SL
-      // (applied below after SL calculation)
-   }
 
    // ── SMT DIVERGENCE CHECK ──
-   // BULL_CONFIRM = DXY weakening + Gold rising = confirms BUY
-   // BEAR_CONFIRM = DXY strengthening + Gold falling = confirms SELL
-   // BULL/BEAR (non-confirm) = unusual co-movement = warn but don't block
+   // BULL_CONFIRM = DXY weakening + Gold rising → confirms BUY, overrides DXY block
+   // BEAR_CONFIRM = DXY strengthening + Gold falling → confirms SELL, overrides DXY block
+   bool smtConfirmedDir = false;
    if(UseSMTDivergence && g_SMTDivergence) {
       bool smtContradict = (isBuy  && g_SMTType == "BEAR_CONFIRM") ||
                            (!isBuy && g_SMTType == "BULL_CONFIRM");
       bool smtConfirm    = (isBuy  && g_SMTType == "BULL_CONFIRM") ||
                            (!isBuy && g_SMTType == "BEAR_CONFIRM");
       if(smtContradict) {
-         g_EntryLog = StringFormat("SMT BLOCKED: %s trade contradicted by SMT (%s) — Gold vs %s",
-                                   isBuy ? "BUY" : "SELL", g_SMTType, SMT_Symbol);
+         g_EntryLog = StringFormat("SMT BLOCKED: %s trade contradicted by SMT (%s)",
+                                   isBuy ? "BUY" : "SELL", g_SMTType);
          return;
       }
-      if(smtConfirm) score += 2; // Small bonus — confirmed direction
+      if(smtConfirm) {
+         score += 2;
+         smtConfirmedDir = true; // SMT confirming = override DXY block below
+      }
    }
 
    // ── DXY CORRELATION CHECK ──
-   if(!IsDXYAligned(isBuy)) {
-      g_EntryLog = StringFormat("DXY BLOCKED: %s trade conflicts with DXY — %s",
+   // If SMT already confirmed the direction (Gold vs DXY divergence), DXY trend block is bypassed —
+   // the divergence itself IS the SMT setup. Otherwise DXY must align.
+   if(!smtConfirmedDir && !IsDXYAligned(isBuy)) {
+      g_EntryLog = StringFormat("DXY BLOCKED: %s trade conflicts with DXY trend — %s",
                                 isBuy ? "BUY" : "SELL", g_DXY_Status);
       g_AlertSent = false;
       return;
    }
 
-   // ── CANDLE CONFIRMATION CHECK ──
-   if(!CheckCandleConfirmation(isBuy, entryTF)) {
-      g_EntryLog = StringFormat("CANDLE: Waiting for confirmation on %s — %s",
-                                TFToString(entryTF), g_CandlePattern);
+   // ── PER-SESSION RISK & TP OVERRIDES ──
+   // Cap tier risk at session's maximum — never exceed session limit
+   double effectiveTP1_RR = sp.tp1RR;
+   double effectiveTP2_RR = sp.tp2RR;
+   riskPct = MathMin(riskPct, sp.risk);
+   if(StringLen(sp.tag) > 0) strategy += "_" + StringSubstr(sp.tag, 1, StringLen(sp.tag)-2);
+
+   // ── SCALED ENTRY GATE ──
+   int openNow    = CountOpenTrades();
+   // OneTradeAtATime overrides scaled entries — hard cap at 1 regardless of score
+   int maxAllowed = OneTradeAtATime ? 1 : GetMaxEntriesForScore(score);
+   // Also cap at session's maxNewTrades
+   maxAllowed = MathMin(maxAllowed, sp.maxNewTrades >= 99 ? maxAllowed : sp.maxNewTrades);
+   if(maxAllowed == 0) {
+      g_EntryLog = StringFormat("SCALED: Score %d below threshold (need %d for 1 entry)",
+                                score, ScaledScore1);
       g_AlertSent = false;
       return;
    }
+   if(openNow >= maxAllowed) {
+      g_EntryLog = StringFormat("SCALED: %d/%d trades open — waiting for close or higher score",
+                                openNow, maxAllowed);
+      return;
+   }
 
-   // Avoid re-alerting same signal
-   if(g_AlertSent && score == g_LastSignalScore) return;
+   // ── BRIDGE STATE MACHINE ──
+   if(UseBridge) {
+      if(g_BridgeState == BRIDGE_WAITING) {
+         CheckBridgeTimeout();
+         if(!ReadBridgeResponse()) return;
+      }
+      if(g_BridgeState == BRIDGE_REJECTED) {
+         g_BridgeState = BRIDGE_IDLE;
+         g_EntryLog    = StringFormat("Claude SKIPPED: %s", g_BridgeReason);
+         return;
+      }
+   }
 
-   // Calculate SL from recent sweep wick
+   // Avoid re-alerting same signal — but DO re-alert if direction flipped
+   if(g_AlertSent && score == g_LastSignalScore && isBuy == g_LastSignalIsBuy) return;
+
+   // Calculate SL from recent sweep wick — minimum 25 pips for gold's volatility
    double pip    = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
    double slRef  = GetSweepLevel(isBuy, entryTF);
    double slPips = MathAbs((isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                   : SymbolInfoDouble(_Symbol, SYMBOL_BID)) - slRef)
                    / pip + SL_BufferPips;
-   slPips = MathMax(slPips, 10.0); // Minimum 10 pip SL
+   slPips = MathMax(slPips, 25.0); // Gold minimum SL: 25 pips ($2.50) — 10 was dangerously small
 
-   // Check minimum RR — sessions with custom TP targets bypass the global MinRR
+   // Check minimum RR — sessions with tight custom TP targets bypass the global MinRR
    double tp2Pips = slPips * effectiveTP2_RR;
-   bool customTP = (curSessIdx == SESS_ASIAN || curSessIdx == SESS_NY_PM);
+   bool customTP = (curSessIdx == SESS_ASIAN    || curSessIdx == SESS_NY_PM ||
+                    curSessIdx == SESS_PRELONDON || curSessIdx == SESS_PRENY);
    if(!customTP && tp2Pips / slPips < MinRR) return;
 
    // Calculate lot size using exact SL
@@ -1696,8 +1724,9 @@ void TryAutoEntry() {
    // Alert regardless of AutoTrade setting
    if(!g_AlertSent) {
       SendSignalNotification(strategy, isBuy, score, entry, sl, tp1, tp2, riskPct, lots);
-      g_AlertSent       = true;
-      g_LastSignalScore = score;
+      g_AlertSent        = true;
+      g_LastSignalScore  = score;
+      g_LastSignalIsBuy  = isBuy;
       g_EntryLog = StringFormat("SIGNAL: %s %s | Score:%d | Entry:%.2f SL:%.2f TP1:%.2f TP2:%.2f | Lots:%.2f",
                                 strategy, isBuy?"BUY":"SELL", score, entry, sl, tp1, tp2, lots);
    }

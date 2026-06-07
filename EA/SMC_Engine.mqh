@@ -602,39 +602,53 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    // judasSwingBull = sweep above Asian high + CHoCH down → SELL setup (reverse of sweep)
    // judasSwingBear = sweep below Asian low  + CHoCH up   → BUY  setup (reverse of sweep)
    //================================================================
-   a.isJudasSwing     = false;
-   a.judasSwingBull   = false; // Sweep ABOVE (bearish reversal — SELL)
-   a.judasSwingBear   = false; // Sweep BELOW (bullish reversal — BUY)
+   //================================================================
+   // DST-AWARE SESSION OPENS — computed first; used by all below
+   //================================================================
    MqlDateTime dt;
    TimeToStruct(TimeGMT(), dt);
-   int phtHour = (dt.hour + 8) % 24;
-   bool atSessionOpen = (phtHour >= 15 && phtHour < 17) || // London Open 3-5PM PHT
-                        (phtHour >= 20 && phtHour < 23);   // NY Open 8-11PM PHT
-   if(atSessionOpen && a.hasLiqSweep && a.hasCHoCH) {
-      a.isJudasSwing   = true;
-      // If price swept ABOVE the Asian high → bearish reversal expected
-      a.judasSwingBull = a.aboveAsianHigh && !a.bullish; // Swept up, now bearish
-      // If price swept BELOW the Asian low  → bullish reversal expected
-      a.judasSwingBear = a.belowAsianLow  && a.bullish;  // Swept down, now bullish
+   datetime nowUTC   = TimeGMT();
+   int londonOpenUTC = GetLondonOpenUTC(nowUTC);  // 7 (summer) or 8 (winter)
+   int nyOpenUTC     = GetNYOpenUTC(nowUTC);       // 12 (summer) or 13 (winter)
+   int londonOpenPHT = (londonOpenUTC + 8) % 24;  // 15 or 16
+   int nyOpenPHT     = (nyOpenUTC     + 8) % 24;  // 20 or 21
+   int utcH          = dt.hour;
+   int utcM          = dt.min;
+   int utcMins       = utcH * 60 + utcM;
+   int phtHour       = (utcH + 8) % 24;
+
+   //================================================================
+   // JUDAS SWING — false move at London/NY open then reversal
+   // Includes pre-session spike windows (price sweeps BEFORE session opens).
+   // judasSwingBull = sweep above Asian high + CHoCH down → SELL setup
+   // judasSwingBear = sweep below Asian low  + CHoCH up   → BUY  setup
+   // atSessionOpen window is DST-aware: covers pre-session + open windows
+   //================================================================
+   a.isJudasSwing     = false;
+   a.judasSwingBull   = false;
+   a.judasSwingBear   = false;
+   {
+      // Window: 90 min before London open through end of London open (+2h)
+      // Window: 30 min before NY open through end of NY AM session (+3h)
+      // All expressed in UTC for DST correctness
+      int loUtcMins = londonOpenUTC * 60;
+      int nyUtcMins = nyOpenUTC     * 60;
+      bool atLondonWindow = (utcMins >= loUtcMins - 90 && utcMins < (loUtcMins + 120));
+      bool atNYWindow     = (utcMins >= nyUtcMins - 30 && utcMins < (nyUtcMins + 180));
+      bool atSessionOpen  = atLondonWindow || atNYWindow;
+      if(atSessionOpen && a.hasLiqSweep && a.hasCHoCH) {
+         a.isJudasSwing   = true;
+         a.judasSwingBull = a.aboveAsianHigh && !a.bullish; // Swept up, now bearish
+         a.judasSwingBear = a.belowAsianLow  && a.bullish;  // Swept down, now bullish
+      }
    }
 
    //================================================================
-   // DST-AWARE SESSION OPENS
-   // All session windows anchor to dynamic London/NY open hours.
-   // Philippines (UTC+8) never observes DST — only London & NY shift.
-   //================================================================
-   datetime nowUTC    = TimeGMT();
-   int londonOpenUTC  = GetLondonOpenUTC(nowUTC);  // 7 (summer/BST) or 8 (winter/GMT)
-   int nyOpenUTC      = GetNYOpenUTC(nowUTC);       // 12 (summer/EDT) or 13 (winter/EST)
-   int londonOpenPHT  = (londonOpenUTC + 8) % 24;  // 15 (3PM) or 16 (4PM)
-   int nyOpenPHT      = (nyOpenUTC     + 8) % 24;  // 20 (8PM) or 21 (9PM)
-
-   //================================================================
-   // SILVER BULLET: 10:00-11:00 AM NY time = nyOpen + 2h UTC
+   // SILVER BULLET: 10:00-11:00 AM NY time = nyOpenUTC + 2h
    //   Summer: 14:00-15:00 UTC = 22:00-23:00 PHT (10PM-11PM)
    //   Winter: 15:00-16:00 UTC = 23:00-00:00 PHT (11PM-midnight)
    //================================================================
-   a.inSilverBullet = (utcH == nyOpenUTC + 2); // always NY+2h, adapts to DST
+   a.inSilverBullet = (utcH == nyOpenUTC + 2); // always NY+2h, DST-correct
 
    //================================================================
    // REJECTION BLOCK / PROPULSION BLOCK
@@ -644,12 +658,7 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
 
    //================================================================
    // ICT KILLZONES — DST-aware UTC anchoring
-   // Asian KZ is fixed (Tokyo/Sydney don't shift for PHT traders).
-   // London and NY KZ follow their respective open hours.
    //================================================================
-   int utcH = dt.hour;
-   int utcM = dt.min;
-   int utcMins = utcH * 60 + utcM;
    // For legacy HHMM comparisons still used below
    int utcT = utcH * 100 + utcM;
    a.inAsianKZ  = (utcT >= 2100 && utcT < 2300);   // always 21-23 UTC (5-7AM PHT)
@@ -693,13 +702,16 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    }
 
    //================================================================
-   // MIDNIGHT OPEN — NY midnight = 05:00 UTC (EST, approx)
+   // MIDNIGHT OPEN — NY midnight in UTC: nyOpenUTC - 8h
+   //   Summer (EDT, nyOpen=12): midnight = 04:00 UTC
+   //   Winter (EST, nyOpen=13): midnight = 05:00 UTC
    //================================================================
    a.midnightOpen    = 0;
    a.nearMidnightOpen = false;
    {
-      datetime midnightUTC = StringToTime(StringFormat("%04d.%02d.%02d 05:00",
-                                                        dt.year, dt.mon, dt.day));
+      int midnightHour = nyOpenUTC - 8; // 4 (summer) or 5 (winter)
+      datetime midnightUTC = StringToTime(StringFormat("%04d.%02d.%02d %02d:00",
+                                                        dt.year, dt.mon, dt.day, midnightHour));
       double moOpen[];
       ArraySetAsSeries(moOpen, false);
       if(CopyOpen(symbol, PERIOD_H1, midnightUTC, 1, moOpen) > 0) {
