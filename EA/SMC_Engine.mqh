@@ -193,6 +193,22 @@ struct SMCAnalysis {
    double   rangeLow;
    double   rangeMid;
 
+   //--- PDH / PDL / PWH / PWL — Previous Day & Week High/Low
+   // These are the #1 institutional liquidity targets every day.
+   // Price sweeps them to grab stop orders, then reverses hard.
+   bool     atPDH;           // Price at Previous Day High (±20 pips)
+   bool     atPDL;           // Price at Previous Day Low  (±20 pips)
+   bool     atPWH;           // Price at Previous Week High (±30 pips)
+   bool     atPWL;           // Price at Previous Week Low  (±30 pips)
+   bool     sweepPDH;        // PDH swept: wick above PDH then close below = SELL setup
+   bool     sweepPDL;        // PDL swept: wick below PDL then close above = BUY setup
+   bool     sweepPWH;        // PWH swept = major SELL reversal signal
+   bool     sweepPWL;        // PWL swept = major BUY reversal signal
+   bool     runningToPDH;    // Bullish move approaching PDH — block further BUY entries
+   bool     runningToPDL;    // Bearish move approaching PDL — block further SELL entries
+   double   prevWeekHigh;    // Previous week's high (= weeklyHigh, aliased for clarity)
+   double   prevWeekLow;     // Previous week's low  (= weeklyLow,  aliased for clarity)
+
    //--- Narrative
    string   narrative;
    string   structureNarrative;
@@ -273,12 +289,52 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    // Asian session high/low (00:00-07:00 UTC)
    ComputeAsianRange(symbol, a);
 
-   // Nearest key S/R to current price
+   // Alias weekly high/low as prev week for code clarity
+   a.prevWeekHigh = a.weeklyHigh;
+   a.prevWeekLow  = a.weeklyLow;
+
+   //================================================================
+   // PDH / PDL / PWH / PWL — Proximity, Sweep & Approach Detection
+   // These are the primary daily and weekly liquidity targets ICT uses.
+   //================================================================
+   double pdProx = pip * 20;   // Within 20 pips = AT the daily level
+   double pwProx = pip * 30;   // Within 30 pips = AT the weekly level
+
+   // Proximity flags — is price at the level right now?
+   a.atPDH = (a.prevDayHigh > 0 && MathAbs(price - a.prevDayHigh) < pdProx);
+   a.atPDL = (a.prevDayLow  > 0 && MathAbs(price - a.prevDayLow)  < pdProx);
+   a.atPWH = (a.prevWeekHigh > 0 && MathAbs(price - a.prevWeekHigh) < pwProx);
+   a.atPWL = (a.prevWeekLow  > 0 && MathAbs(price - a.prevWeekLow)  < pwProx);
+
+   // Sweep flags — wick pierced the level but candle closed back the other side
+   // Check last 5 bars (sweep may have happened a few bars ago)
+   a.sweepPDH = false; a.sweepPDL = false;
+   a.sweepPWH = false; a.sweepPWL = false;
+   int swLB = MathMin(6, lookback);
+   for(int sw = 1; sw < swLB; sw++) {
+      if(!a.sweepPDH && a.prevDayHigh > 0 && high[sw] > a.prevDayHigh && close[sw] < a.prevDayHigh)
+         a.sweepPDH = true;
+      if(!a.sweepPDL && a.prevDayLow  > 0 && low[sw]  < a.prevDayLow  && close[sw] > a.prevDayLow)
+         a.sweepPDL = true;
+      if(!a.sweepPWH && a.prevWeekHigh > 0 && high[sw] > a.prevWeekHigh && close[sw] < a.prevWeekHigh)
+         a.sweepPWH = true;
+      if(!a.sweepPWL && a.prevWeekLow  > 0 && low[sw]  < a.prevWeekLow  && close[sw] > a.prevWeekLow)
+         a.sweepPWL = true;
+   }
+
+   // Approach flags — price is heading TOWARD a level from the near side (within 50 pips)
+   // Buying into PDH overhead = bad entry (resistance above). Selling into PDL below = bad.
+   a.runningToPDH = (a.bullish && a.prevDayHigh > 0 && price < a.prevDayHigh &&
+                     (a.prevDayHigh - price) < pip * 50);
+   a.runningToPDL = (!a.bullish && a.prevDayLow > 0 && price > a.prevDayLow &&
+                     (price - a.prevDayLow) < pip * 50);
+
+   // Nearest key S/R to current price — include PDH/PDL/PWH/PWL
    double srLevels[8];
-   srLevels[0] = a.weeklyHigh; srLevels[1] = a.weeklyLow;
-   srLevels[2] = a.dailyHigh;  srLevels[3] = a.dailyLow;
-   srLevels[4] = a.prevDayHigh;srLevels[5] = a.prevDayLow;
-   srLevels[6] = a.asianHigh;  srLevels[7] = a.asianLow;
+   srLevels[0] = a.prevWeekHigh; srLevels[1] = a.prevWeekLow;
+   srLevels[2] = a.prevDayHigh;  srLevels[3] = a.prevDayLow;
+   srLevels[4] = a.dailyHigh;    srLevels[5] = a.dailyLow;
+   srLevels[6] = a.asianHigh;    srLevels[7] = a.asianLow;
 
    a.nearestSR = 0;
    double minDist = DBL_MAX;
@@ -899,13 +955,19 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
       a.hasWeakHigh   ? StringFormat("Y@%.2f", a.weakHigh) : "N",
       a.hasWeakLow    ? StringFormat("Y@%.2f", a.weakLow)  : "N");
 
+   string pdStr = StringFormat("PDH:%.2f%s PDL:%.2f%s | PWH:%.2f%s PWL:%.2f%s",
+      a.prevDayHigh,  a.sweepPDH ? "(SWEPT)" : (a.atPDH ? "(AT)" : ""),
+      a.prevDayLow,   a.sweepPDL ? "(SWEPT)" : (a.atPDL ? "(AT)" : ""),
+      a.prevWeekHigh, a.sweepPWH ? "(SWEPT)" : (a.atPWH ? "(AT)" : ""),
+      a.prevWeekLow,  a.sweepPWL ? "(SWEPT)" : (a.atPWL ? "(AT)" : ""));
+
    a.srNarrative = StringFormat(
-      "KZ:%s | %s | MidOpen:%.2f | IPDA20:%.2f-%.2f | W:%.2f/%.2f",
+      "KZ:%s | %s | MidOpen:%.2f | IPDA20:%.2f-%.2f | %s",
       a.killzoneName,
       a.inICTMacro    ? StringFormat("MACRO:%s", a.macroName) : "No Macro",
       a.midnightOpen,
       a.ipda20Low, a.ipda20High,
-      a.weeklyHigh, a.weeklyLow);
+      pdStr);
 
    a.narrative = a.structureNarrative;
 
@@ -941,6 +1003,20 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    if(a.hasNDOG || a.hasNWOG)        a.score += 1;  // Opening gap present
    if(a.hasWeakHigh && !a.bullish)    a.score += 1;  // Weak high = sweep target above
    if(a.hasWeakLow  &&  a.bullish)    a.score += 1;  // Weak low  = sweep target below
+   // --- PDH / PDL / PWH / PWL (max +8) ---
+   // AT the level with sweep = highest-probability ICT reversal
+   if(a.sweepPDH && !a.bullish)           a.score += 4; // PDH swept → SELL reversal
+   if(a.sweepPDL &&  a.bullish)           a.score += 4; // PDL swept → BUY  reversal
+   if(a.sweepPWH && !a.bullish)           a.score += 5; // PWH swept → major SELL signal
+   if(a.sweepPWL &&  a.bullish)           a.score += 5; // PWL swept → major BUY  signal
+   // AT the level without confirmed sweep = potential reaction
+   if(a.atPDH && !a.bullish && !a.sweepPDH) a.score += 2;
+   if(a.atPDL &&  a.bullish && !a.sweepPDL) a.score += 2;
+   if(a.atPWH && !a.bullish && !a.sweepPWH) a.score += 3;
+   if(a.atPWL &&  a.bullish && !a.sweepPWL) a.score += 3;
+   // Penalty: buying toward PDH overhead or selling toward PDL below = fighting levels
+   if(a.runningToPDH &&  a.bullish)       a.score -= 2;
+   if(a.runningToPDL && !a.bullish)       a.score -= 2;
    // --- Penalties ---
    if(a.hasMitigatedOB && !a.hasFreshOB) a.score -= 2;
    if(a.hasFVGClosed   && !a.hasFVGOpen) a.score -= 1;
@@ -1053,6 +1129,18 @@ int ScorePrimaryAdvanced(SMCAnalysis &h4, SMCAnalysis &h1, SMCAnalysis &m15) {
    if(m15.hasWeakLow  &&  h4.bullish)              score += 1; // Weak low as bull target
    if(m15.hasWeakHigh && !h4.bullish)              score += 1; // Weak high as bear target
 
+   // PDH / PDL / PWH / PWL — Daily & Weekly liquidity levels (max +8)
+   if(h4.sweepPWH && !h4.bullish)                 score += 5; // PWH swept → major SELL
+   if(h4.sweepPWL &&  h4.bullish)                 score += 5; // PWL swept → major BUY
+   if(h1.sweepPDH && !h4.bullish)                 score += 4; // PDH swept → SELL reversal
+   if(h1.sweepPDL &&  h4.bullish)                 score += 4; // PDL swept → BUY  reversal
+   if(h1.atPDH    && !h4.bullish && !h1.sweepPDH) score += 2; // At PDH, no sweep yet
+   if(h1.atPDL    &&  h4.bullish && !h1.sweepPDL) score += 2; // At PDL, no sweep yet
+   if(h4.atPWH    && !h4.bullish && !h4.sweepPWH) score += 3; // At PWH, no sweep yet
+   if(h4.atPWL    &&  h4.bullish && !h4.sweepPWL) score += 3; // At PWL, no sweep yet
+   if(h1.runningToPDH &&  h4.bullish)             score -= 2; // Buying into PDH overhead
+   if(h1.runningToPDL && !h4.bullish)             score -= 2; // Selling into PDL below
+
    // Penalties
    if(h4.hasMitigatedOB && !h4.hasFreshOB)            score -= 3;
    if(h1.hasFVGClosed    && !h1.hasFVGOpen)            score -= 2;
@@ -1095,6 +1183,18 @@ int ScoreFallbackAdvanced(SMCAnalysis &h1, SMCAnalysis &m15, SMCAnalysis &m5) {
    if(m15.hasNDOG || h1.hasNWOG)                  score += 1;
    if(m5.hasWeakLow  &&  h1.bullish)               score += 1;
    if(m5.hasWeakHigh && !h1.bullish)               score += 1;
+
+   // PDH / PDL / PWH / PWL — Fallback tier uses H1 for PDH/PDL, M15 for proximity
+   if(h1.sweepPWH && !h1.bullish)                 score += 5;
+   if(h1.sweepPWL &&  h1.bullish)                 score += 5;
+   if(m15.sweepPDH && !h1.bullish)                score += 4;
+   if(m15.sweepPDL &&  h1.bullish)                score += 4;
+   if(m15.atPDH    && !h1.bullish)                score += 2;
+   if(m15.atPDL    &&  h1.bullish)                score += 2;
+   if(h1.atPWH     && !h1.bullish)                score += 3;
+   if(h1.atPWL     &&  h1.bullish)                score += 3;
+   if(m15.runningToPDH &&  h1.bullish)            score -= 2;
+   if(m15.runningToPDL && !h1.bullish)            score -= 2;
 
    if(h1.hasMitigatedOB && !h1.hasFreshOB)             score -= 3;
    if(m15.hasFVGClosed   && !m15.hasFVGOpen)           score -= 2;
@@ -1143,6 +1243,18 @@ int ScoreTertiaryAdvanced(SMCAnalysis &m15, SMCAnalysis &m5, SMCAnalysis &m1) {
    if(m5.hasNDOG)                                   score += 1;
    if(m1.hasWeakLow  &&  m15.bullish)              score += 1;
    if(m1.hasWeakHigh && !m15.bullish)              score += 1;
+
+   // PDH / PDL / PWH / PWL — Tertiary uses M15/M5 for level detection
+   if(m15.sweepPWH && !m15.bullish)               score += 5;
+   if(m15.sweepPWL &&  m15.bullish)               score += 5;
+   if(m5.sweepPDH  && !m15.bullish)               score += 4;
+   if(m5.sweepPDL  &&  m15.bullish)               score += 4;
+   if(m5.atPDH     && !m15.bullish)               score += 2;
+   if(m5.atPDL     &&  m15.bullish)               score += 2;
+   if(m15.atPWH    && !m15.bullish)               score += 3;
+   if(m15.atPWL    &&  m15.bullish)               score += 3;
+   if(m5.runningToPDH &&  m15.bullish)            score -= 2;
+   if(m5.runningToPDL && !m15.bullish)            score -= 2;
 
    // Penalties
    if(m15.hasMitigatedOB && !m15.hasFreshOB)             score -= 3;

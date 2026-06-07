@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.13"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.13"
+#property version     "13.14"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.14"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -1363,10 +1363,21 @@ void TryAutoEntry() {
    if(!IsTradingAllowed()) return;
 
    // Pre-session blackout — danger zone before London/NY open.
-   // Existing trades are still managed (breakeven, trail, TP) — only new entries blocked.
    if(IsInPreSessionBlackout()) {
       g_EntryLog = "Blackout: " + g_Session + " — no new entries, managing existing";
       return;
+   }
+
+   // Universal spread check — all sessions (Asian has its own tighter check below)
+   {
+      double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+      double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+                         SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+      if(curSpread > MaxSpreadPips) {
+         g_EntryLog = StringFormat("SPREAD: %.1f pips > max %.1f — waiting for spread to tighten",
+                                   curSpread, MaxSpreadPips);
+         return;
+      }
    }
 
    // Load per-session parameters
@@ -1506,6 +1517,29 @@ void TryAutoEntry() {
       if(!g_M15.hasMSS && !g_M5.hasMSS) {
          g_EntryLog = StringFormat("%s no-Judas: MSS required — spike not yet confirmed as reversal",
                                    sp.tag);
+         return;
+      }
+   }
+
+   // ── PDH/PDL/PWH/PWL RUNNING-INTO BLOCK ──
+   // Don't buy when price is charging toward PDH overhead (resistance 50 pips away).
+   // Don't sell when price is charging toward PDL below (support 50 pips away).
+   // Exception: if the level is being SWEPT (Judas into the level) allow the trade.
+   bool pdSweepActive = isBuy  ? (g_H1.sweepPDL || g_H1.sweepPWL || g_M15.sweepPDL) :
+                                  (g_H1.sweepPDH || g_H1.sweepPWH || g_M15.sweepPDH);
+   if(!pdSweepActive) {
+      if(isBuy  && (g_H1.runningToPDH || g_H4.runningToPDH)) {
+         g_EntryLog = StringFormat("PDH BLOCK: BUY blocked — PDH at %.2f is %.1f pips overhead (resistance)",
+                                   g_H1.prevDayHigh,
+                                   (g_H1.prevDayHigh - SymbolInfoDouble(_Symbol, SYMBOL_ASK)) /
+                                   (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10));
+         return;
+      }
+      if(!isBuy && (g_H1.runningToPDL || g_H4.runningToPDL)) {
+         g_EntryLog = StringFormat("PDL BLOCK: SELL blocked — PDL at %.2f is %.1f pips below (support)",
+                                   g_H1.prevDayLow,
+                                   (SymbolInfoDouble(_Symbol, SYMBOL_BID) - g_H1.prevDayLow) /
+                                   (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10));
          return;
       }
    }
@@ -3601,6 +3635,25 @@ void UpdateDashboard() {
    string judasStr = judasNow ? "  |  JUDAS SWING ACTIVE" : "";
    color biasClr = g_DailyBiasLocked ? (g_DailyBias ? ColorBull : ColorBear) : ColorNeutral;
    SetLabel(PREFIX+"T2c", x, y, biasStr + judasStr, biasClr, FontSize);
+   y += dy;
+
+   // PDH / PDL / PWH / PWL — key daily & weekly liquidity levels
+   {
+      string pdh = StringFormat("PDH:%.2f%s", g_H1.prevDayHigh,
+                     g_H1.sweepPDH ? " SWEPT!" : (g_H1.atPDH ? " AT" : ""));
+      string pdl = StringFormat("PDL:%.2f%s", g_H1.prevDayLow,
+                     g_H1.sweepPDL ? " SWEPT!" : (g_H1.atPDL ? " AT" : ""));
+      string pwh = StringFormat("PWH:%.2f%s", g_H4.prevWeekHigh,
+                     g_H4.sweepPWH ? " SWEPT!" : (g_H4.atPWH ? " AT" : ""));
+      string pwl = StringFormat("PWL:%.2f%s", g_H4.prevWeekLow,
+                     g_H4.sweepPWL ? " SWEPT!" : (g_H4.atPWL ? " AT" : ""));
+      bool anySwept = g_H1.sweepPDH || g_H1.sweepPDL || g_H4.sweepPWH || g_H4.sweepPWL;
+      bool anyAt    = g_H1.atPDH || g_H1.atPDL || g_H4.atPWH || g_H4.atPWL;
+      color pdColor = anySwept ? clrOrangeRed : anyAt ? clrGold : ColorNeutral;
+      SetLabel(PREFIX+"T2d", x, y,
+               StringFormat("Levels: %s  |  %s  |  %s  |  %s", pdh, pdl, pwh, pwl),
+               pdColor, FontSize);
+   }
    y += dy + 4;
 
    // ── PRIMARY STRATEGY H4 / H1 / M15 ──
