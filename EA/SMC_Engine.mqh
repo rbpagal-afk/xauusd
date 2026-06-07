@@ -8,6 +8,60 @@
 #define SMC_ENGINE_MQH
 
 //+------------------------------------------------------------------+
+//| DST-aware session open helpers                                   |
+//| Philippines (PHT = UTC+8) never observes DST.                   |
+//| London and NY shift ±1h twice a year — computed here in UTC.    |
+//+------------------------------------------------------------------+
+int SMC_DaysInMonth(int year, int month) {
+   if(month == 2) return (year%4==0 && (year%100!=0 || year%400==0)) ? 29 : 28;
+   if(month==4 || month==6 || month==9 || month==11) return 30;
+   return 31;
+}
+
+// Day-of-month for the Nth Sunday in year/month.  nth=1 → first, nth=-1 → last.
+int SMC_NthSundayDay(int year, int month, int nth) {
+   MqlDateTime d; ArrayInitialize(d, 0);
+   d.year = year; d.mon = month; d.day = 1;
+   TimeToStruct(StructToTime(d), d);
+   int firstSun = (d.day_of_week == 0) ? 1 : 8 - d.day_of_week;
+   if(nth > 0) return firstSun + (nth - 1) * 7;
+   int dim = SMC_DaysInMonth(year, month);
+   int s   = firstSun;
+   while(s + 7 <= dim) s += 7;
+   return s;
+}
+
+// UK BST: last Sunday March 01:00 UTC  →  last Sunday October 01:00 UTC
+bool IsLondonDST(datetime utcTime) {
+   MqlDateTime dt; TimeToStruct(utcTime, dt);
+   int y = dt.year;
+   datetime bstOn  = StringToTime(StringFormat("%04d.03.%02d 01:00", y, SMC_NthSundayDay(y,  3, -1)));
+   datetime bstOff = StringToTime(StringFormat("%04d.10.%02d 01:00", y, SMC_NthSundayDay(y, 10, -1)));
+   return (utcTime >= bstOn && utcTime < bstOff);
+}
+
+// US EDT: 2nd Sunday March 07:00 UTC  →  1st Sunday November 06:00 UTC
+bool IsNYDST(datetime utcTime) {
+   MqlDateTime dt; TimeToStruct(utcTime, dt);
+   int y = dt.year;
+   datetime edtOn  = StringToTime(StringFormat("%04d.03.%02d 07:00", y, SMC_NthSundayDay(y,  3, 2)));
+   datetime edtOff = StringToTime(StringFormat("%04d.11.%02d 06:00", y, SMC_NthSundayDay(y, 11, 1)));
+   return (utcTime >= edtOn && utcTime < edtOff);
+}
+
+// London open in UTC: 07:00 when BST active, 08:00 when GMT (winter)
+int GetLondonOpenUTC(datetime utcTime = 0) {
+   if(utcTime == 0) utcTime = TimeGMT();
+   return IsLondonDST(utcTime) ? 7 : 8;
+}
+
+// NY open in UTC: 12:00 when EDT active, 13:00 when EST (winter)
+int GetNYOpenUTC(datetime utcTime = 0) {
+   if(utcTime == 0) utcTime = TimeGMT();
+   return IsNYDST(utcTime) ? 12 : 13;
+}
+
+//+------------------------------------------------------------------+
 //| Extended TF Analysis Structure                                   |
 //+------------------------------------------------------------------+
 struct SMCAnalysis {
@@ -565,12 +619,22 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    }
 
    //================================================================
-   // SILVER BULLET WINDOWS (ICT):
-   //   10:00-11:00 AM NY = 15:00-16:00 UTC = 23:00-00:00 PHT  ← primary
-   //    2:00- 3:00 PM NY = 19:00-20:00 UTC = 03:00-04:00 PHT  ← but NY PM session ends 1AM PHT
-   // Only the 10AM window falls inside NY PM session (11PM-1AM PHT)
+   // DST-AWARE SESSION OPENS
+   // All session windows anchor to dynamic London/NY open hours.
+   // Philippines (UTC+8) never observes DST — only London & NY shift.
    //================================================================
-   a.inSilverBullet = (phtHour == 23 || phtHour == 0); // 11PM or midnight PHT
+   datetime nowUTC    = TimeGMT();
+   int londonOpenUTC  = GetLondonOpenUTC(nowUTC);  // 7 (summer/BST) or 8 (winter/GMT)
+   int nyOpenUTC      = GetNYOpenUTC(nowUTC);       // 12 (summer/EDT) or 13 (winter/EST)
+   int londonOpenPHT  = (londonOpenUTC + 8) % 24;  // 15 (3PM) or 16 (4PM)
+   int nyOpenPHT      = (nyOpenUTC     + 8) % 24;  // 20 (8PM) or 21 (9PM)
+
+   //================================================================
+   // SILVER BULLET: 10:00-11:00 AM NY time = nyOpen + 2h UTC
+   //   Summer: 14:00-15:00 UTC = 22:00-23:00 PHT (10PM-11PM)
+   //   Winter: 15:00-16:00 UTC = 23:00-00:00 PHT (11PM-midnight)
+   //================================================================
+   a.inSilverBullet = (utcH == nyOpenUTC + 2); // always NY+2h, adapts to DST
 
    //================================================================
    // REJECTION BLOCK / PROPULSION BLOCK
@@ -579,37 +643,49 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
                                               a.bullish, lookback);
 
    //================================================================
-   // ICT KILLZONES (UTC hours)
+   // ICT KILLZONES — DST-aware UTC anchoring
+   // Asian KZ is fixed (Tokyo/Sydney don't shift for PHT traders).
+   // London and NY KZ follow their respective open hours.
    //================================================================
    int utcH = dt.hour;
    int utcM = dt.min;
-   int utcT = utcH * 100 + utcM; // HHMM integer for range checks
-   a.inAsianKZ   = (utcT >= 2100 && utcT <  2300);
-   a.inLondonKZ  = (utcT >= 700  && utcT <   900);
-   a.inNYAmKZ    = (utcT >= 1200 && utcT <  1500);
-   a.inNYPMKZ    = (utcT >= 1500 && utcT <  1700);
-   a.killzoneName = a.inLondonKZ ? "London KZ (3PM-5PM PHT)" :
-                    a.inNYAmKZ   ? "NY AM KZ (8PM-11PM PHT)" :
-                    a.inNYPMKZ   ? "NY PM/Close KZ (11PM-1AM PHT)" :
+   int utcMins = utcH * 60 + utcM;
+   // For legacy HHMM comparisons still used below
+   int utcT = utcH * 100 + utcM;
+   a.inAsianKZ  = (utcT >= 2100 && utcT < 2300);   // always 21-23 UTC (5-7AM PHT)
+   a.inLondonKZ = (utcH >= londonOpenUTC && utcH < londonOpenUTC + 2);
+   a.inNYAmKZ   = (utcH >= nyOpenUTC     && utcH < nyOpenUTC + 3);
+   a.inNYPMKZ   = (utcH >= nyOpenUTC + 3 && utcH < nyOpenUTC + 5);
+   a.killzoneName = a.inLondonKZ ? StringFormat("London KZ (%dPM-%dPM PHT)", londonOpenPHT, londonOpenPHT+2) :
+                    a.inNYAmKZ   ? StringFormat("NY AM KZ (%dPM-%dPM PHT)",   nyOpenPHT,     nyOpenPHT+3)    :
+                    a.inNYPMKZ   ? StringFormat("NY PM KZ (%dPM-%dAM PHT)",   nyOpenPHT+3,  (nyOpenPHT+5)%24) :
                     a.inAsianKZ  ? "Asian KZ (5AM-7AM PHT)" : "No Active KZ";
 
    //================================================================
-   // ICT MACROS (UTC times — NY EST + 5 hours)
-   // NY 02:33-03:00 | 04:03-04:30 | 08:50-09:10 | 10:10-10:40 | 11:50-12:10
+   // ICT MACROS — offsets in minutes from London/NY open (DST-safe)
+   // London Open Macro: L+0:33 – L+1:00
+   // London AM Macro:   L+2:03 – L+2:30
+   // NY Lunch Macro:    NY+1:50 – NY+2:10
+   // NY AM Macro:       NY+3:10 – NY+3:40
+   // NY PM Macro:       NY+4:50 – NY+5:10
    //================================================================
-   int macroStart[5] = {733, 903, 1350, 1510, 1650};
-   int macroEnd[5]   = {800, 930, 1410, 1540, 1710};
+   int londonOpenMin = londonOpenUTC * 60;
+   int nyOpenMin     = nyOpenUTC * 60;
+   int macroStartMin[5] = { londonOpenMin + 33,  londonOpenMin + 123,
+                             nyOpenMin    + 110,  nyOpenMin    + 190,  nyOpenMin + 290 };
+   int macroEndMin[5]   = { londonOpenMin + 60,  londonOpenMin + 150,
+                             nyOpenMin    + 130,  nyOpenMin    + 220,  nyOpenMin + 310 };
    string macroLabels[5] = {
-      "London Open Macro (3:33-4:00 PM PHT)",
-      "London AM Macro (5:03-5:30 PM PHT)",
-      "NY Lunch Macro (9:50-10:10 PM PHT)",
-      "NY AM Macro (11:10-11:40 PM PHT)",
-      "NY PM Macro (12:50-1:10 AM PHT)"
+      StringFormat("London Open Macro (%d:33-%d:00 PHT)", londonOpenPHT, londonOpenPHT+1),
+      StringFormat("London AM Macro (%d:03-%d:30 PHT)",   londonOpenPHT+2, londonOpenPHT+2),
+      StringFormat("NY Lunch Macro (%d:50-%d:10 PHT)",    nyOpenPHT+1, nyOpenPHT+2),
+      StringFormat("NY AM Macro (%d:10-%d:40 PHT)",       nyOpenPHT+3, nyOpenPHT+3),
+      StringFormat("NY PM Macro (%d:50-%d:10 PHT)",       nyOpenPHT+4, nyOpenPHT+5)
    };
    a.inICTMacro = false;
    a.macroName  = "";
    for(int mi = 0; mi < 5; mi++) {
-      if(utcT >= macroStart[mi] && utcT <= macroEnd[mi]) {
+      if(utcMins >= macroStartMin[mi] && utcMins < macroEndMin[mi]) {
          a.inICTMacro = true;
          a.macroName  = macroLabels[mi];
          break;

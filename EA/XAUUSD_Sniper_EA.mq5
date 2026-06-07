@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.11"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.11"
+#property version     "13.12"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.12"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -1235,15 +1235,16 @@ int GetMaxEntriesForScore(int score) {
 //| Session index from current session string                       |
 //+------------------------------------------------------------------+
 int GetSessionIndex() {
-   // Pre-session spike windows use dynamic strings (contain countdown) — check with StringFind
-   if(StringFind(g_Session, "Pre-London Spike") >= 0) return SESS_PRELONDON;
-   if(StringFind(g_Session, "Pre-NY Spike")     >= 0) return SESS_PRENY;
-   if(g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)")       return SESS_ASIAN;
-   if(g_Session == "Pre-Market — Asian Extension (7AM-3PM PHT)")           return SESS_PREMARKET;
-   if(g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)")           return SESS_LONDON_OPEN;
-   if(g_Session == "London Session — Selective Trades (5PM-8PM PHT)")      return SESS_LONDON_MID;
-   if(g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)")           return SESS_NY_OPEN;
-   if(g_Session == "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)")     return SESS_NY_PM;
+   // All session strings now contain dynamic PHT times — use StringFind (partial match)
+   if(StringFind(g_Session, "Pre-London Spike")       >= 0) return SESS_PRELONDON;
+   if(StringFind(g_Session, "Pre-NY Spike")           >= 0) return SESS_PRENY;
+   if(StringFind(g_Session, "Asian KZ")               >= 0) return SESS_ASIAN;
+   if(StringFind(g_Session, "Pre-Market")             >= 0) return SESS_PREMARKET;
+   if(StringFind(g_Session, "London Open")            >= 0) return SESS_LONDON_OPEN;
+   if(StringFind(g_Session, "London Session")         >= 0) return SESS_LONDON_MID;
+   if(StringFind(g_Session, "New York Open")          >= 0) return SESS_NY_OPEN;
+   if(StringFind(g_Session, "NY PM / Silver Bullet")  >= 0) return SESS_NY_PM;
+   if(StringFind(g_Session, "NY Closed")              >= 0) return SESS_OTHER;
    return SESS_OTHER;
 }
 
@@ -2049,53 +2050,63 @@ void AnalyzeAllTimeframes() {
 //| Get current session in PHT (UTC+8)                              |
 //+------------------------------------------------------------------+
 string GetSession() {
-   MqlDateTime dt;
-   TimeToStruct(TimeGMT(), dt);
-   int mins = dt.min;
+   datetime nowUTC = TimeGMT();
+   MqlDateTime dt; TimeToStruct(nowUTC, dt);
 
-   // Convert UTC to PHT (+8) — total minutes since midnight PHT
-   int phtTotalMins = ((dt.hour + 8) % 24) * 60 + mins;
-   int pht          = phtTotalMins / 60;
+   // DST-aware session opens — Philippines (UTC+8) never observes DST
+   int loUTC  = GetLondonOpenUTC(nowUTC);   // 7 (summer/BST) or 8 (winter/GMT)
+   int nyUTC  = GetNYOpenUTC(nowUTC);        // 12 (summer/EDT) or 13 (winter/EST)
+   int loPHT  = (loUTC + 8) % 24;           // 15 (3PM) or 16 (4PM)
+   int nyPHT  = (nyUTC + 8) % 24;           // 20 (8PM) or 21 (9PM)
 
-   // Pre-London spike window: [3PM PHT - PreLondonBlackoutMins] to 3PM PHT
-   // → Asian range being swept, Judas Swing loading up — tradeable with high confluence
+   // Work in UTC minutes for sub-hour accuracy
+   int utcMins = dt.hour * 60 + dt.min;
+
+   // Pre-London spike window: [loUTC - PreLondonBlackoutMins, loUTC)
+   // Asian range being swept → prime Judas Swing loading zone
    {
-      int londonOpenMins = 15 * 60;
-      int preLoStart     = londonOpenMins - PreLondonBlackoutMins;
-      if(phtTotalMins >= preLoStart && phtTotalMins < londonOpenMins) {
-         int minsLeft = londonOpenMins - phtTotalMins;
-         return StringFormat("Pre-London Spike — Judas Loading (%d min to London)", minsLeft);
+      int loMins    = loUTC * 60;
+      int preLoMins = loMins - PreLondonBlackoutMins;
+      if(utcMins >= preLoMins && utcMins < loMins) {
+         int minsLeft = loMins - utcMins;
+         return StringFormat("Pre-London Spike — Judas Loading (%d min to %dPM PHT)", minsLeft, loPHT);
       }
    }
 
-   // Pre-NY spike window: [8PM PHT - PreNYBlackoutMins] to 8PM PHT
-   // → London range sweep, trap retail, Judas loading — tradeable with high confluence
+   // Pre-NY spike window: [nyUTC - PreNYBlackoutMins, nyUTC)
+   // London range sweep → Judas Swing into NY direction
    {
-      int nyOpenMins = 20 * 60;
-      int preNyStart = nyOpenMins - PreNYBlackoutMins;
-      if(phtTotalMins >= preNyStart && phtTotalMins < nyOpenMins) {
-         int minsLeft = nyOpenMins - phtTotalMins;
-         return StringFormat("Pre-NY Spike — Judas Loading (%d min to NY Open)", minsLeft);
+      int nyMins    = nyUTC * 60;
+      int preNyMins = nyMins - PreNYBlackoutMins;
+      if(utcMins >= preNyMins && utcMins < nyMins) {
+         int minsLeft = nyMins - utcMins;
+         return StringFormat("Pre-NY Spike — Judas Loading (%d min to %dPM PHT)", minsLeft, nyPHT);
       }
    }
 
-   // PHT (UTC+8) session windows for gold trader in Philippines:
-   // Asian KZ:    05:00-07:00 PHT (21:00-23:00 UTC)
-   // Pre-market:  07:00-13:30 PHT — rest / prepare / Asian extension
-   // Pre-London:  13:30-15:00 PHT — Asian range sweep, Judas spike window
-   // London Open: 15:00-17:00 PHT (07:00-09:00 UTC) ← TRADE WINDOW 1
-   // London Sess: 17:00-19:30 PHT (09:00-11:30 UTC) — selective
-   // Pre-NY:      19:30-20:00 PHT — London range sweep, Judas spike window
-   // NY Open:     20:00-23:00 PHT (12:00-15:00 UTC) ← BEST TRADE WINDOW
-   // NY PM Close: 23:00-01:00 PHT (15:00-17:00 UTC) — Silver Bullet / wind down
-   // NY Closed:   01:00-05:00 PHT — sleep
-   if(pht >= 5  && pht < 7)   return "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)";
-   if(pht >= 7  && pht < 15)  return "Pre-Market — Asian Extension (7AM-3PM PHT)";
-   if(pht >= 15 && pht < 17)  return "London Open — TRADE WINDOW 1 (3PM-5PM PHT)";
-   if(pht >= 17 && pht < 20)  return "London Session — Selective Trades (5PM-8PM PHT)";
-   if(pht >= 20 && pht < 23)  return "New York Open — BEST WINDOW (8PM-11PM PHT)";
-   if(pht >= 23 || pht < 1)   return "NY PM / Silver Bullet — Wind Down (11PM-1AM PHT)";
-   return "NY Closed — Sleep (1AM-5AM PHT)";
+   // Main session windows anchored to dynamic UTC opens:
+   // Asian KZ:    21:00-23:00 UTC — fixed (Tokyo/Sydney don't shift PHT)
+   // Pre-Market:  23:00 UTC → pre-London start (spans UTC midnight)
+   // London Open: loUTC → loUTC+2
+   // London Mid:  loUTC+2 → nyUTC (minus pre-NY window, handled above)
+   // NY Open:     nyUTC → nyUTC+3
+   // NY PM/SB:    nyUTC+3 → nyUTC+5
+   // NY Closed:   nyUTC+5 → 21:00 UTC
+   int utcH = dt.hour;
+   if(utcH >= 21 && utcH < 23)
+      return "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)";
+   if(utcH >= loUTC && utcH < loUTC + 2)
+      return StringFormat("London Open — TRADE WINDOW 1 (%dPM-%dPM PHT)", loPHT, loPHT+2);
+   if(utcH >= loUTC + 2 && utcH < nyUTC)
+      return StringFormat("London Session — Selective Trades (%dPM-%dPM PHT)", loPHT+2, nyPHT);
+   if(utcH >= nyUTC && utcH < nyUTC + 3)
+      return StringFormat("New York Open — BEST WINDOW (%dPM-%dPM PHT)", nyPHT, nyPHT+3);
+   if(utcH >= nyUTC + 3 && utcH < nyUTC + 5)
+      return StringFormat("NY PM / Silver Bullet — Wind Down (%dPM-%dAM PHT)", nyPHT+3, (nyPHT+5)%24);
+   if(utcH >= nyUTC + 5 && utcH < 21)
+      return "NY Closed — Sleep (1AM-5AM PHT)";
+   // Everything else: pre-market (23:00 UTC → pre-London; spans midnight)
+   return StringFormat("Pre-Market — Asian Extension (7AM-%dPM PHT)", loPHT);
 }
 
 //+------------------------------------------------------------------+
@@ -3508,13 +3519,23 @@ void UpdateDashboard() {
             ColorTitle, FontSize + 1);
    y += dy + 2;
 
-   // Current time PHT
+   // Current time PHT + DST status
    MqlDateTime dt;
-   TimeToStruct(TimeGMT(), dt);
-   int pht = (dt.hour + 8) % 24;
+   datetime nowUTC = TimeGMT();
+   TimeToStruct(nowUTC, dt);
+   int pht       = (dt.hour + 8) % 24;
+   int loUTC_d   = GetLondonOpenUTC(nowUTC);
+   int nyUTC_d   = GetNYOpenUTC(nowUTC);
+   int loPHT_d   = (loUTC_d + 8) % 24;
+   int nyPHT_d   = (nyUTC_d + 8) % 24;
+   bool lonDST   = IsLondonDST(nowUTC);
+   bool nyDST    = IsNYDST(nowUTC);
+   string dstStr = (lonDST && nyDST) ? "Summer (BST+EDT)" :
+                   (!lonDST && !nyDST) ? "Winter (GMT+EST)" :
+                   lonDST ? "Trans: UK-DST, US-STD" : "Trans: US-DST, UK-STD";
    SetLabel(PREFIX+"T1", x, y,
-            StringFormat("PHT Time: %02d:%02d  |  Chart TF: %s  |  Symbol: %s",
-                         pht, dt.min, TFToString(Period()), _Symbol),
+            StringFormat("PHT Time: %02d:%02d  |  %s  |  London %dPM | NY %dPM PHT",
+                         pht, dt.min, dstStr, loPHT_d, nyPHT_d),
             ColorNeutral, FontSize);
    y += dy;
 
