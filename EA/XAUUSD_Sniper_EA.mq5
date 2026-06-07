@@ -1788,8 +1788,10 @@ void TryAutoEntry() {
    // Bypass in Asian/Pre-market (range fade at extremes already checked above).
    if(curSessIdx != SESS_ASIAN && curSessIdx != SESS_PREMARKET) {
       bool atZone = false;
-      SMCAnalysis *ref_ptr = primaryReady ? &g_H1 : (fallbackReady ? &g_M15 : &g_M5);
-      SMCAnalysis ref = ref_ptr[0];
+      SMCAnalysis ref;
+      if(primaryReady)       ref = g_H1;
+      else if(fallbackReady) ref = g_M15;
+      else                   ref = g_M5;
       atZone = atZone || ref.inOTE;           // Price in 61.8-79% retracement
       atZone = atZone || ref.atCE;            // At FVG midpoint (CE)
       atZone = atZone || (ref.hasFreshOB &&
@@ -1979,8 +1981,10 @@ void TryAutoEntry() {
    // If enabled: price approaching FVG but not yet inside → place BUY/SELL LIMIT at CE.
    // If price is already inside FVG → fall back to market order (immediate execution).
    if(UsePendingOrders) {
-      SMCAnalysis *fvgRef_ptr = primaryReady ? &g_H1 : (fallbackReady ? &g_M15 : &g_M5);
-      SMCAnalysis fvgRef = fvgRef_ptr[0];
+      SMCAnalysis fvgRef;
+      if(primaryReady)       fvgRef = g_H1;
+      else if(fallbackReady) fvgRef = g_M15;
+      else                   fvgRef = g_M5;
       bool hasFVG      = fvgRef.hasFVGOpen && fvgRef.fvgHigh > 0 && fvgRef.fvgLow > 0;
       bool insideFVG   = hasFVG && ask >= fvgRef.fvgLow && bid <= fvgRef.fvgHigh;
       bool approachFVG = hasFVG && !insideFVG &&
@@ -4413,12 +4417,10 @@ void UpdateDashboard() {
    y += dy;
 
    // Current TF data depending on which tier is active
-   SMCAnalysis *ict_ref_ptr = g_UseTertiary ? &g_M1  : (g_UseFallback ? &g_M5  : &g_M15);
-   SMCAnalysis *ict_mid_ptr = g_UseTertiary ? &g_M5  : (g_UseFallback ? &g_M15 : &g_H1);
-   SMCAnalysis *ict_htf_ptr = g_UseTertiary ? &g_M15 : (g_UseFallback ? &g_H1  : &g_H4);
-   SMCAnalysis ict_ref = ict_ref_ptr[0];
-   SMCAnalysis ict_mid = ict_mid_ptr[0];
-   SMCAnalysis ict_htf = ict_htf_ptr[0];
+   SMCAnalysis ict_ref, ict_mid, ict_htf;
+   if(g_UseTertiary)      { ict_ref = g_M1;  ict_mid = g_M5;  ict_htf = g_M15; }
+   else if(g_UseFallback) { ict_ref = g_M5;  ict_mid = g_M15; ict_htf = g_H1;  }
+   else                   { ict_ref = g_M15; ict_mid = g_H1;  ict_htf = g_H4;  }
 
    // Killzone & Macro
    string kzStr = (ict_ref.killzoneName != "") ? ict_ref.killzoneName : "Outside Killzone";
