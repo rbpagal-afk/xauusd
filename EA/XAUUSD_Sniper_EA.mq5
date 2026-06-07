@@ -6,8 +6,8 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "13.15"
-#property description "XAUUSD Sniper EA — Telegram Remote Control v13.15"
+#property version     "13.16"
+#property description "XAUUSD Sniper EA — Telegram Remote Control v13.16"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -157,6 +157,12 @@ input double           AsianTP1_RR        = 0.8;    // TP1 RR for Asian (tighter
 input double           AsianTP2_RR        = 1.5;    // TP2 RR for Asian (target opposite range wall)
 input double           AsianMaxSpread     = 20.0;   // Block Asian trade if spread > this (pips)
 input bool             AsianRangeOnly     = true;   // Asian: only trade at range extremes (OB + sweep)
+
+input group            "=== FVG PENDING ORDERS ==="
+input bool             UsePendingOrders     = true;   // Place BUY/SELL LIMIT at FVG CE instead of market order
+input int              PendingExpiryBars    = 8;      // Cancel pending if unfilled after this many M15 bars
+input double           PendingFVGBuffer     = 2.0;    // Extra pips inside FVG edge for limit price
+input bool             PendingMarketFallback = true;  // Fall back to market order if price already inside FVG
 
 input group            "=== SCALED ENTRIES (SCORE-BASED) ==="
 input bool             UseScaledEntries  = true;   // Scale max simultaneous trades by confluence score
@@ -425,6 +431,17 @@ double      g_PendingLots     = 0;
 double      g_PendingRisk     = 0;
 string      g_PendingStrategy = "";
 int         g_PendingScore    = 0;
+
+//--- FVG pending order tracking
+struct FVGPending {
+   ulong    ticket;          // MT5 order ticket
+   bool     isBuy;           // Direction of the pending order
+   datetime placedBar;       // M15 bar time when placed (for expiry)
+   double   fvgHigh;         // FVG zone high (for invalidation check)
+   double   fvgLow;          // FVG zone low
+   string   strategy;        // Strategy tag for logging
+};
+FVGPending g_FVGPendings[];  // Active FVG pending orders placed by EA
 
 //--- Lot size calculator state
 double     g_LastLotSize       = 0;
@@ -1113,6 +1130,7 @@ void OnTick() {
    CheckSessionClose();
    ManageCapitalProtection();
    ManageIdleTrades();
+   ManagePendingOrders();
    AnalyzeAllTimeframes();
    TryAutoEntry();
 
@@ -1890,7 +1908,44 @@ void TryAutoEntry() {
    g_LastTP1RR = effectiveTP1_RR;
    g_LastTP2RR = effectiveTP2_RR;
 
-   // ── SCALED ENTRIES — execute up to maxAllowed trades ──
+   // ── FVG PENDING ORDER MODE ──
+   // If enabled: price approaching FVG but not yet inside → place BUY/SELL LIMIT at CE.
+   // If price is already inside FVG → fall back to market order (immediate execution).
+   if(UsePendingOrders) {
+      SMCAnalysis &fvgRef = (primaryReady ? g_H1 : (fallbackReady ? g_M15 : g_M5));
+      bool hasFVG      = fvgRef.hasFVGOpen && fvgRef.fvgHigh > 0 && fvgRef.fvgLow > 0;
+      bool insideFVG   = hasFVG && ask >= fvgRef.fvgLow && bid <= fvgRef.fvgHigh;
+      bool approachFVG = hasFVG && !insideFVG &&
+                         (isBuy  ? (ask > fvgRef.fvgHigh && (ask - fvgRef.fvgHigh) < pip * 30) :
+                                   (bid < fvgRef.fvgLow  && (fvgRef.fvgLow - bid)  < pip * 30));
+
+      if(approachFVG) {
+         // Only one FVG pending per direction at a time
+         bool alreadyPending = false;
+         for(int pi = 0; pi < ArraySize(g_FVGPendings); pi++) {
+            if(g_FVGPendings[pi].isBuy == isBuy) { alreadyPending = true; break; }
+         }
+         if(!alreadyPending) {
+            PlaceFVGPendingOrder(isBuy, fvgRef.fvgHigh, fvgRef.fvgLow, fvgRef.fvgMid,
+                                 sl, tp1, tp2, lots, strategy, score);
+            g_LastEntryBar = currentBar;
+         } else {
+            g_EntryLog = StringFormat("FVG LIMIT: Already have %s limit pending — waiting for fill or expiry",
+                                      isBuy ? "BUY" : "SELL");
+         }
+         return;
+      }
+
+      // Price inside FVG: market order if fallback enabled, otherwise wait for pullback
+      if(hasFVG && insideFVG && !PendingMarketFallback) {
+         g_EntryLog = StringFormat("FVG MODE: Price inside FVG (%.2f-%.2f) — waiting for CE pullback entry",
+                                   fvgRef.fvgLow, fvgRef.fvgHigh);
+         return;
+      }
+      // No FVG detected or price already inside with fallback enabled → fall through to market order
+   }
+
+   // ── SCALED MARKET ENTRIES — execute up to maxAllowed trades ──
    // Each entry staggers its TP2 slightly to avoid all closing at the same tick
    int toPlace  = MathMax(1, MathMin(maxAllowed - openNow,
                               UseScaledEntries ? maxAllowed - openNow : 1));
@@ -1933,6 +1988,123 @@ void TryAutoEntry() {
       g_EntryLog += StringFormat(" | %d FAILED (Error %d: %s)",
                                  failed, Trade.ResultRetcode(),
                                  Trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| FVG Pending Orders — place limit at CE, manage expiry/cancel   |
+//+------------------------------------------------------------------+
+bool PlaceFVGPendingOrder(bool isBuy, double fvgHigh, double fvgLow, double fvgMid,
+                          double sl, double tp1, double tp2, double lots,
+                          string strategy, int score) {
+   double pip    = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+   double buf    = PendingFVGBuffer * pip;
+
+   // Limit price: CE (midpoint) shifted slightly inside FVG for better fill
+   double limitPrice = isBuy  ? fvgMid + buf   // BUY LIMIT: just above CE into the gap
+                               : fvgMid - buf;  // SELL LIMIT: just below CE into the gap
+   limitPrice = NormalizeDouble(limitPrice, _Digits);
+
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
+   req.action       = TRADE_ACTION_PENDING;
+   req.symbol       = _Symbol;
+   req.volume       = lots;
+   req.type         = isBuy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+   req.price        = limitPrice;
+   req.sl           = NormalizeDouble(sl,  _Digits);
+   req.tp           = NormalizeDouble(tp2, _Digits);
+   req.magic        = MagicNumber;
+   req.deviation    = MaxSlippagePips;
+   req.type_time    = ORDER_TIME_SPECIFIED;
+   req.expiration   = iTime(_Symbol, TF_M15, 0) + PendingExpiryBars * PeriodSeconds(TF_M15);
+   req.comment      = StringFormat("Sniper FVG %s %s Sc:%d", strategy, isBuy?"BUY":"SELL", score);
+
+   bool ok = OrderSend(req, res);
+   if(ok && res.order > 0) {
+      int n = ArraySize(g_FVGPendings);
+      ArrayResize(g_FVGPendings, n + 1);
+      g_FVGPendings[n].ticket    = res.order;
+      g_FVGPendings[n].isBuy     = isBuy;
+      g_FVGPendings[n].placedBar = iTime(_Symbol, TF_M15, 0);
+      g_FVGPendings[n].fvgHigh   = fvgHigh;
+      g_FVGPendings[n].fvgLow    = fvgLow;
+      g_FVGPendings[n].strategy  = strategy;
+      g_EntryLog = StringFormat("FVG LIMIT PLACED: %s %s @ %.2f | FVG %.2f-%.2f CE:%.2f | SL:%.2f TP:%.2f | Ticket:#%d",
+                                strategy, isBuy?"BUY":"SELL", limitPrice,
+                                fvgLow, fvgHigh, fvgMid, sl, tp2, (long)res.order);
+      return true;
+   }
+   g_EntryLog = StringFormat("FVG LIMIT FAILED: %s %s @ %.2f | Error %d: %s",
+                             strategy, isBuy?"BUY":"SELL", limitPrice,
+                             res.retcode, Trade.ResultRetcodeDescription());
+   return false;
+}
+
+void ManagePendingOrders() {
+   if(ArraySize(g_FVGPendings) == 0) return;
+
+   double pip        = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+   datetime nowBar   = iTime(_Symbol, TF_M15, 0);
+   int      sessIdx  = GetSessionIndex();
+   int      toRemove[];
+
+   for(int i = 0; i < ArraySize(g_FVGPendings); i++) {
+      ulong ticket = g_FVGPendings[i].ticket;
+
+      // Check if order still exists
+      if(!OrderSelect(ticket)) {
+         // Already filled or externally cancelled — remove tracking entry
+         ArrayResize(toRemove, ArraySize(toRemove) + 1);
+         toRemove[ArraySize(toRemove)-1] = i;
+         continue;
+      }
+
+      bool shouldCancel = false;
+      string cancelReason = "";
+
+      // 1. Expiry: PendingExpiryBars M15 bars passed since placement
+      datetime placedBar = g_FVGPendings[i].placedBar;
+      int barsElapsed = (int)((nowBar - placedBar) / PeriodSeconds(TF_M15));
+      if(barsElapsed >= PendingExpiryBars) {
+         shouldCancel  = true;
+         cancelReason  = StringFormat("FVG LIMIT EXPIRED: %d bars elapsed (max %d)", barsElapsed, PendingExpiryBars);
+      }
+
+      // 2. Session changed to non-trading session — no point waiting
+      if(!shouldCancel && sessIdx == SESS_OTHER) {
+         shouldCancel = true;
+         cancelReason = "FVG LIMIT CANCELLED: Session ended";
+      }
+
+      // 3. FVG invalidated: price traded THROUGH the zone (FVG filled from wrong side)
+      if(!shouldCancel) {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         bool fvgBroken = g_FVGPendings[i].isBuy  ? (bid < g_FVGPendings[i].fvgLow  - pip * 3) :
+                                                     (ask > g_FVGPendings[i].fvgHigh + pip * 3);
+         if(fvgBroken) {
+            shouldCancel = true;
+            cancelReason = StringFormat("FVG INVALIDATED: Price broke through FVG zone (%.2f-%.2f)",
+                                        g_FVGPendings[i].fvgLow, g_FVGPendings[i].fvgHigh);
+         }
+      }
+
+      if(shouldCancel) {
+         Trade.OrderDelete(ticket);
+         g_EntryLog = cancelReason;
+         ArrayResize(toRemove, ArraySize(toRemove) + 1);
+         toRemove[ArraySize(toRemove)-1] = i;
+      }
+   }
+
+   // Remove cancelled/filled entries (reverse order to preserve indices)
+   for(int r = ArraySize(toRemove) - 1; r >= 0; r--) {
+      int idx = toRemove[r];
+      int n   = ArraySize(g_FVGPendings);
+      for(int j = idx; j < n - 1; j++)
+         g_FVGPendings[j] = g_FVGPendings[j+1];
+      ArrayResize(g_FVGPendings, n - 1);
    }
 }
 
@@ -3165,6 +3337,12 @@ void CloseAllTrades(string reason) {
       if(PositionInfo.Magic()  != MagicNumber) continue;
       Trade.PositionClose(PositionInfo.Ticket());
    }
+   // Also cancel all FVG pending orders — no point leaving limits open after session ends
+   for(int i = ArraySize(g_FVGPendings) - 1; i >= 0; i--) {
+      if(OrderSelect(g_FVGPendings[i].ticket))
+         Trade.OrderDelete(g_FVGPendings[i].ticket);
+   }
+   ArrayResize(g_FVGPendings, 0);
    g_EntryLog = StringFormat("ALL TRADES CLOSED: %s", reason);
 }
 
