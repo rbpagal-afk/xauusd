@@ -137,6 +137,7 @@ input double           NYPMMaxTrades_New  = 1;      // No new trades if already 
 input double           NYPMTP2_RR         = 2.0;    // NY PM TP2 RR (tighter — less time left in session)
 
 input group            "=== ASIAN SESSION (5AM-7AM PHT) ==="
+input bool             TradePremarket     = true;   // Allow trades during Pre-Market 7AM-3PM PHT (Asian extension rules)
 input bool             TradeAsianSession  = true;   // Allow trades during Asian KZ (5AM-7AM PHT)
 input double           AsianRisk          = 0.5;    // Risk % during Asian session (smaller — range market)
 input int              AsianMinScore      = 9;      // Minimum score to trade Asian session (higher bar)
@@ -315,7 +316,7 @@ string     g_CandlePattern     = "None"; // Pattern detected: Engulf / PinBar / 
 //| Adaptive Learning — confluence snapshot at trade entry          |
 //+------------------------------------------------------------------+
 #define CONFLUENCE_COUNT 20
-#define SESSION_COUNT     6
+#define SESSION_COUNT     7
 
 string g_ConfluenceNames[CONFLUENCE_COUNT] = {
    "H4 ExtBOS",  "H4 MSS",       "H4 FreshOB",  "H4 AtSR",
@@ -327,14 +328,15 @@ string g_ConfluenceNames[CONFLUENCE_COUNT] = {
 
 // Session index constants — must match g_SessionNames order
 #define SESS_ASIAN       0
-#define SESS_LONDON_OPEN 1
-#define SESS_LONDON_MID  2
-#define SESS_NY_OPEN     3
-#define SESS_NY_PM       4
-#define SESS_OTHER       5
+#define SESS_PREMARKET   1
+#define SESS_LONDON_OPEN 2
+#define SESS_LONDON_MID  3
+#define SESS_NY_OPEN     4
+#define SESS_NY_PM       5
+#define SESS_OTHER       6
 
 string g_SessionNames[SESSION_COUNT] = {
-   "Asian KZ", "London Open", "London Mid", "NY Open", "NY PM/SB", "Other"
+   "Asian KZ", "Pre-Market", "London Open", "London Mid", "NY Open", "NY PM/SB", "Other"
 };
 
 struct ConfluenceStats {
@@ -1208,6 +1210,7 @@ int GetMaxEntriesForScore(int score) {
 //+------------------------------------------------------------------+
 int GetSessionIndex() {
    if(g_Session == "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)")       return SESS_ASIAN;
+   if(g_Session == "Pre-Market — Asian Extension (7AM-3PM PHT)")           return SESS_PREMARKET;
    if(g_Session == "London Open — TRADE WINDOW 1 (3PM-5PM PHT)")           return SESS_LONDON_OPEN;
    if(g_Session == "London Session — Selective Trades (5PM-8PM PHT)")      return SESS_LONDON_MID;
    if(g_Session == "New York Open — BEST WINDOW (8PM-11PM PHT)")           return SESS_NY_OPEN;
@@ -1239,6 +1242,15 @@ SessionParams GetSessionParams() {
          p.tp1RR        = AsianTP1_RR;
          p.tp2RR        = AsianTP2_RR;
          p.tag          = "[ASIAN-RANGE]";
+         break;
+      case SESS_PREMARKET:
+         // Same conservative rules as Asian — range market, low liquidity
+         p.risk         = AsianRisk;
+         p.minScore     = AsianMinScore;
+         p.maxNewTrades = TradePremarket ? 1 : 0;
+         p.tp1RR        = AsianTP1_RR;
+         p.tp2RR        = AsianTP2_RR;
+         p.tag          = "[PRE-MKT]";
          break;
       case SESS_LONDON_OPEN:
          p.risk         = LondonRisk;
@@ -1295,9 +1307,11 @@ void TryAutoEntry() {
    int curSessIdx   = GetSessionIndex();
 
    // Block sessions that are not in a trade window
-   bool isAsian  = (curSessIdx == SESS_ASIAN);
-   bool inSession = (curSessIdx != SESS_OTHER) &&
-                    !(isAsian && !TradeAsianSession);
+   bool isAsian     = (curSessIdx == SESS_ASIAN);
+   bool isPremarket = (curSessIdx == SESS_PREMARKET);
+   bool inSession   = (curSessIdx != SESS_OTHER) &&
+                      !(isAsian     && !TradeAsianSession) &&
+                      !(isPremarket && !TradePremarket);
    if(!inSession || sp.maxNewTrades == 0) { g_AlertSent = false; return; }
 
    // NY PM: block new trades if already at limit
@@ -1312,8 +1326,8 @@ void TryAutoEntry() {
       return;
    }
 
-   // Asian session: spread and range-extreme filters
-   if(isAsian) {
+   // Asian / Pre-market: spread and range-extreme filters
+   if(isAsian || isPremarket) {
       double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
       double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
                          SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 0.1;
@@ -1858,7 +1872,7 @@ string GetSession() {
    // NY PM Close: 23:00-01:00 PHT (15:00-17:00 UTC) — Silver Bullet / wind down
    // NY Closed:   01:00-05:00 PHT — sleep
    if(pht >= 5  && pht < 7)   return "Asian KZ — Watch for Judas Sweep (5AM-7AM PHT)";
-   if(pht >= 7  && pht < 15)  return "Pre-Market — Prepare Charts (Rest)";
+   if(pht >= 7  && pht < 15)  return "Pre-Market — Asian Extension (7AM-3PM PHT)";
    if(pht >= 15 && pht < 17)  return "London Open — TRADE WINDOW 1 (3PM-5PM PHT)";
    if(pht >= 17 && pht < 20)  return "London Session — Selective Trades (5PM-8PM PHT)";
    if(pht >= 20 && pht < 23)  return "New York Open — BEST WINDOW (8PM-11PM PHT)";
@@ -2486,8 +2500,10 @@ string GetRecommendation() {
    SessionParams rsp    = GetSessionParams();
    int           rsi    = GetSessionIndex();
    bool isAsianRec      = (rsi == SESS_ASIAN);
+   bool isPremarketRec  = (rsi == SESS_PREMARKET);
    bool inTradeSession  = (rsi != SESS_OTHER) &&
-                          !(isAsianRec && !TradeAsianSession) &&
+                          !(isAsianRec    && !TradeAsianSession) &&
+                          !(isPremarketRec && !TradePremarket)   &&
                           (rsp.maxNewTrades > 0);
 
    if(!inTradeSession)
@@ -3271,8 +3287,9 @@ void UpdateDashboard() {
    // Session + active parameters
    int    dsi = GetSessionIndex();
    SessionParams dsp = GetSessionParams();
-   color sessionColor = (dsi == SESS_LONDON_OPEN || dsi == SESS_NY_OPEN) ? ColorBull :
-                        (dsi == SESS_ASIAN || dsi == SESS_LONDON_MID || dsi == SESS_NY_PM) ? ColorWarn :
+   color sessionColor = (dsi == SESS_LONDON_OPEN || dsi == SESS_NY_OPEN)                           ? ColorBull :
+                        (dsi == SESS_ASIAN || dsi == SESS_PREMARKET ||
+                         dsi == SESS_LONDON_MID || dsi == SESS_NY_PM)                             ? ColorWarn :
                         ColorNeutral;
    SetLabel(PREFIX+"T2", x, y,
             StringFormat("Session: %s", g_Session), sessionColor, FontSize);
