@@ -1413,6 +1413,7 @@ SessionParams GetSessionParams() {
 //+------------------------------------------------------------------+
 void TryAutoEntry() {
    if(!IsTradingAllowed()) return;
+   double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0; // declared once for entire function
 
    // Pre-session blackout — danger zone before London/NY open.
    if(IsInPreSessionBlackout()) {
@@ -1422,7 +1423,6 @@ void TryAutoEntry() {
 
    // Universal spread check — all sessions (Asian has its own tighter check below)
    {
-      double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
       double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
                          SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
       if(curSpread > MaxSpreadPips) {
@@ -1434,7 +1434,6 @@ void TryAutoEntry() {
 
    // ATR volatility filter — block entries during dead chop and news spike blow-offs
    if(UseATRFilter) {
-      double pip  = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
       int atrHnd  = iATR(_Symbol, TF_H1, ATR_Period);
       double atrBuf[];
       ArraySetAsSeries(atrBuf, true);
@@ -1485,7 +1484,6 @@ void TryAutoEntry() {
 
    // Asian / Pre-market: spread and range-extreme filters
    if(isAsian || isPremarket) {
-      double pip       = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
       double curSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
                          SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
       if(curSpread > AsianMaxSpread) {
@@ -1593,7 +1591,6 @@ void TryAutoEntry() {
          }
       }
       // Must be at Asian range extreme — no mid-range entries
-      double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
       bool atAsianExtreme =
          ( isBuy && g_M15.asianLow  > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_BID) - g_M15.asianLow)  < pip * 20) ||
          (!isBuy && g_M15.asianHigh > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_ASK) - g_M15.asianHigh) < pip * 20);
@@ -1886,7 +1883,6 @@ void TryAutoEntry() {
    if(g_AlertSent && score == g_LastSignalScore && isBuy == g_LastSignalIsBuy) return;
 
    // Calculate SL — either ATR-based or sweep-wick based
-   double pip    = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
    double slPips;
    if(UseATRStop) {
       int atrHnd2 = iATR(_Symbol, TF_H1, ATR_Period);
