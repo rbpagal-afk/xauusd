@@ -1591,13 +1591,23 @@ void TryAutoEntry() {
          }
       }
       // Must be at Asian range extreme — no mid-range entries
-      bool atAsianExtreme =
-         ( isBuy && g_M15.asianLow  > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_BID) - g_M15.asianLow)  < pip * 20) ||
-         (!isBuy && g_M15.asianHigh > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_ASK) - g_M15.asianHigh) < pip * 20);
+      bool atAsianExtreme = false;
+      double asianEdge = 0;
+      string asianEdgeName = "";
+      if(isBuy) {
+         asianEdge     = g_M15.asianLow;
+         asianEdgeName = "Low";
+         if(asianEdge > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_BID) - asianEdge) < pip * 20)
+            atAsianExtreme = true;
+      } else {
+         asianEdge     = g_M15.asianHigh;
+         asianEdgeName = "High";
+         if(asianEdge > 0 && MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_ASK) - asianEdge) < pip * 20)
+            atAsianExtreme = true;
+      }
       if(!atAsianExtreme) {
          g_EntryLog = StringFormat("ASIAN: Mid-range — price must reach Asian %s (%.2f) within 20 pips",
-                                   isBuy ? "Low" : "High",
-                                   isBuy ? g_M15.asianLow : g_M15.asianHigh);
+                                   asianEdgeName, asianEdge);
          return;
       }
    }
