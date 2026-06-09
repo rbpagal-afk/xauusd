@@ -4754,6 +4754,36 @@ string GetDailyJournalName() {
                        dt.year, dt.mon, dt.day);
 }
 
+// Returns session block label: Asian | London | NY
+string GetSessionBlock() {
+   int si = GetSessionIndex();
+   if(si == SESS_ASIAN || si == SESS_PREMARKET)                          return "Asian";
+   if(si == SESS_PRELONDON || si == SESS_LONDON_OPEN || si == SESS_LONDON_MID) return "London";
+   if(si == SESS_PRENY || si == SESS_NY_OPEN || si == SESS_NY_PM)        return "NY";
+   return "Other";
+}
+
+// Returns the session-specific CSV filename e.g. XAUUSD_Sniper_Journal_2026.06.09_London.csv
+string GetSessionJournalName() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return StringFormat("XAUUSD_Sniper_Journal_%04d.%02d.%02d_%s.csv",
+                       dt.year, dt.mon, dt.day, GetSessionBlock());
+}
+
+void EnsureSessionJournalHeader(string fileName) {
+   if(FileIsExist(fileName, FILE_COMMON)) return;
+   int fh = FileOpen(fileName, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   if(fh == INVALID_HANDLE) return;
+   FileWrite(fh,
+      "Date", "Time(PHT)", "Symbol", "Direction", "Strategy",
+      "Score", "Entry", "SL", "TP1", "TP2",
+      "Lots", "Risk%", "SL_Pips", "Exit", "Profit_USD",
+      "Profit%", "RR_Achieved", "Result", "Session",
+      "BE_Used", "TP1_Hit", "Trail_Used");
+   FileClose(fh);
+}
+
 void InitJournal() {
    if(!UseJournal) return;
    string todayFile = GetDailyJournalName();
@@ -4853,6 +4883,36 @@ void JournalWriteTrade(ulong ticket, string strategy, int score,
       trailUsed ? "Yes" : "No");
 
    FileClose(fh);
+
+   // Also write to session-specific CSV (Asian / London / NY)
+   string sessFile = GetSessionJournalName();
+   EnsureSessionJournalHeader(sessFile);
+   int sfh = FileOpen(sessFile, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   if(sfh != INVALID_HANDLE) {
+      FileSeek(sfh, 0, SEEK_END);
+      FileWrite(sfh,
+         TimeToString(TimeCurrent(), TIME_DATE),
+         StringFormat("%02d:%02d PHT", phtHour, dt.min),
+         _Symbol, dir, strategy,
+         IntegerToString(score),
+         DoubleToString(entry,  _Digits),
+         DoubleToString(sl,     _Digits),
+         DoubleToString(tp1,    _Digits),
+         DoubleToString(tp2,    _Digits),
+         DoubleToString(lots,   2),
+         DoubleToString(riskPct, 1),
+         DoubleToString(slPips, 1),
+         DoubleToString(exitPrice, _Digits),
+         DoubleToString(profitUSD, 2),
+         DoubleToString(profitPct, 2),
+         DoubleToString(rrAchieved, 2),
+         result,
+         g_Session,
+         beUsed    ? "Yes" : "No",
+         tp1Hit    ? "Yes" : "No",
+         trailUsed ? "Yes" : "No");
+      FileClose(sfh);
+   }
 
    // Update in-memory stats
    g_TotalTrades++;
