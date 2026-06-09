@@ -3075,12 +3075,7 @@ void TryAutoEntry() {
                           StringFind(ref.obStatus, "In OB") >= 0); // Inside OB
       atZone = atZone || ref.atIPDALevel;     // At IPDA 20/40/60 day boundary
       atZone = atZone || g_M15.inOTE || g_M15.atCE;
-      if(!atZone) {
-         g_EntryLog = StringFormat("ZONE CHECK: Not at OTE/CE/OB/IPDA — waiting for pullback to entry zone (%s)",
-                                   strategy);
-         g_AlertSent = false;
-         return;
-      }
+      if(atZone) score += 3; // At sniper zone = bonus, not a blocker
    }
 
    // ── CANDLE CONFIRMATION — adds to score instead of blocking ──
@@ -3181,7 +3176,11 @@ void TryAutoEntry() {
    double tp2Pips = slPips * effectiveTP2_RR;
    bool customTP = (curSessIdx == SESS_ASIAN    || curSessIdx == SESS_NY_PM ||
                     curSessIdx == SESS_PRELONDON || curSessIdx == SESS_PRENY);
-   if(!customTP && tp2Pips / slPips < MinRR) return;
+   if(!customTP && tp2Pips / slPips < MinRR) {
+      g_EntryLog = StringFormat("RR CHECK FAILED: %.2f RR < %.1f minimum — SL too wide or TP too close",
+                                tp2Pips / slPips, MinRR);
+      return;
+   }
 
    // Calculate lot size using exact SL
    double lots = CalcLotSize(riskPct, slPips);
