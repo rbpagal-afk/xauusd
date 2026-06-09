@@ -1293,9 +1293,9 @@ input int              BOS_Lookback      = 50;     // BOS lookback bars
 input int              OB_Lookback       = 10;     // Order Block lookback bars
 input int              FVG_Lookback      = 5;      // FVG lookback bars
 input int              Sweep_Lookback    = 5;      // Liquidity Sweep lookback bars
-input int              MinPrimaryScore   = 4;      // Min score for primary trade (H4→H1→M15)
-input int              MinFallbackScore  = 5;      // Min score for fallback trade (H1→M15→M5)
-input int              MinTertiaryScore  = 6;      // Min score for tertiary scalp (M15→M5→M1)
+input int              MinPrimaryScore   = 7;      // Min score for primary trade (H4→H1→M15)
+input int              MinFallbackScore  = 9;      // Min score for fallback trade (H1→M15→M5)
+input int              MinTertiaryScore  = 11;     // Min score for tertiary scalp (M15→M5→M1)
 
 input group            "=== RISK PER TRADE ==="
 input double           PrimaryRisk       = 2.0;    // Primary risk % (H4→H1→M15)
@@ -1305,9 +1305,9 @@ input double           MinRR             = 2.0;    // Minimum Risk:Reward
 
 input group            "=== DAILY PROFIT & LOSS LIMITS ==="
 input double           DailyProfitTarget = 5.0;    // Daily profit target % (e.g. 5 = stop at +5%)
-input double           DailyLossLimit    = 20.0;   // Daily max loss % (e.g. 2 = stop at -2%)
-input int              MaxDailyTrades    = 20;      // Max total trades per day
-input int              MaxConsecLosses   = 10;      // Max consecutive losses before stopping
+input double           DailyLossLimit    = 2.0;    // Daily max loss % (e.g. 2 = stop at -2%)
+input int              MaxDailyTrades    = 3;       // Max total trades per day
+input int              MaxConsecLosses   = 2;       // Max consecutive losses before stopping
 
 input group            "=== TRADE PROTECTION ==="
 input bool             UseBreakeven      = true;   // Move SL to entry when profitable
@@ -1323,13 +1323,13 @@ input double           TP1_RR            = 1.0;    // TP1 Risk:Reward ratio (1:1
 input double           TP2_RR            = 3.0;    // TP2 Risk:Reward ratio (1:3)
 
 input group            "=== DXY CORRELATION FILTER ==="
-input bool             UseDXYFilter      = false;  // Block trades conflicting with DXY direction
+input bool             UseDXYFilter      = true;   // Block trades conflicting with DXY direction
 input string           DXY_Symbol        = "USDX"; // DXY symbol on your broker (try USDX, DXY, DX)
 input int              DXY_Lookback      = 20;     // Bars to determine DXY trend
 input double           DXY_MinMove       = 0.10;   // Min DXY move (price units) to confirm trend
 
 input group            "=== CANDLE CONFIRMATION FILTER ==="
-input bool             UseCandleConfirm  = false;  // Require confirmation candle before entry
+input bool             UseCandleConfirm  = true;   // Require confirmation candle before entry
 input double           EngulfMinRatio    = 1.2;    // Engulfing body must be X times previous body
 input double           PinBarWickRatio   = 2.0;    // Wick must be X times body for pin bar
 input double           MinBodyPips       = 3.0;    // Minimum body size in pips to count as valid
@@ -1339,7 +1339,7 @@ input double           MaxSpreadPips     = 30.0;   // Max allowed spread in pips
 input int              MaxSlippagePips   = 3;       // Max slippage in pips
 
 input group            "=== HIGH IMPACT NEWS FILTER ==="
-input bool             UseNewsFilter     = false;  // Block trades near high impact news
+input bool             UseNewsFilter     = true;   // Block trades near high impact news
 input bool             BlockHighOnly     = true;   // true=High only | false=High+Medium
 input int              NewsMinutesBefore = 30;     // Minutes before news to block entry
 input int              NewsMinutesAfter  = 30;     // Minutes after news to resume
@@ -1441,7 +1441,7 @@ input int              ScaledScore2      = 9;      // Score threshold for 2 simu
 input int              ScaledScore3      = 10;     // Score threshold for 3 simultaneous entries
 
 input group            "=== ATR VOLATILITY FILTER ==="
-input bool             UseATRFilter       = false;   // Block entries when market is too choppy or spiking
+input bool             UseATRFilter       = true;    // Block entries when market is too choppy or spiking
 input int              ATR_Period         = 14;       // ATR period (H1 bars)
 input double           ATR_ChopThreshold  = 8.0;     // Block if H1 ATR < this many pips (dead chop)
 input double           ATR_SpikeThreshold = 60.0;    // Block if H1 ATR > this many pips (news spike)
