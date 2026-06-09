@@ -1323,13 +1323,13 @@ input double           TP1_RR            = 1.0;    // TP1 Risk:Reward ratio (1:1
 input double           TP2_RR            = 3.0;    // TP2 Risk:Reward ratio (1:3)
 
 input group            "=== DXY CORRELATION FILTER ==="
-input bool             UseDXYFilter      = true;   // Block trades conflicting with DXY direction
+input bool             UseDXYFilter      = false;  // DXY now adds to score instead of blocking
 input string           DXY_Symbol        = "USDX"; // DXY symbol on your broker (try USDX, DXY, DX)
 input int              DXY_Lookback      = 20;     // Bars to determine DXY trend
 input double           DXY_MinMove       = 0.10;   // Min DXY move (price units) to confirm trend
 
 input group            "=== CANDLE CONFIRMATION FILTER ==="
-input bool             UseCandleConfirm  = true;   // Require confirmation candle before entry
+input bool             UseCandleConfirm  = false;  // Candle confirmation now adds to score instead of blocking
 input double           EngulfMinRatio    = 1.2;    // Engulfing body must be X times previous body
 input double           PinBarWickRatio   = 2.0;    // Wick must be X times body for pin bar
 input double           MinBodyPips       = 3.0;    // Minimum body size in pips to count as valid
@@ -3083,12 +3083,10 @@ void TryAutoEntry() {
       }
    }
 
-   // ── CANDLE CONFIRMATION CHECK — before expensive checks ──
-   if(!CheckCandleConfirmation(isBuy, entryTF)) {
-      g_EntryLog = StringFormat("CANDLE: Waiting for %s confirmation on %s",
-                                isBuy ? "bullish" : "bearish", TFToString(entryTF));
-      g_AlertSent = false;
-      return;
+   // ── CANDLE CONFIRMATION — adds to score instead of blocking ──
+   if(CheckCandleConfirmation(isBuy, entryTF)) {
+      score += 3; // confirmed candle pattern = strong bonus
+      strategy += "_CC";
    }
 
    // ── SMT DIVERGENCE CHECK ──
@@ -3111,14 +3109,11 @@ void TryAutoEntry() {
       }
    }
 
-   // ── DXY CORRELATION CHECK ──
-   // If SMT already confirmed the direction (Gold vs DXY divergence), DXY trend block is bypassed —
-   // the divergence itself IS the SMT setup. Otherwise DXY must align.
-   if(!smtConfirmedDir && !IsDXYAligned(isBuy)) {
-      g_EntryLog = StringFormat("DXY BLOCKED: %s trade conflicts with DXY trend — %s",
-                                isBuy ? "BUY" : "SELL", g_DXY_Status);
-      g_AlertSent = false;
-      return;
+   // ── DXY CORRELATION — adds to score instead of blocking ──
+   // Aligned DXY = bonus points. Opposing DXY = no bonus, but trade still allowed.
+   if(IsDXYAligned(isBuy)) {
+      score += 2; // DXY confirms direction = extra confluence
+      strategy += "_DXY";
    }
 
    // ── PER-SESSION RISK & TP OVERRIDES ──
