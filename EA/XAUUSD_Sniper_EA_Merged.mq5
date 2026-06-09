@@ -2080,10 +2080,10 @@ void UpdateDXY() {
    // DXY bullish = USD strengthening = headwind for gold BUY
    if(g_DXY_Change >= DXY_MinMove) {
       g_DXY_Bullish = true;
-      g_DXY_Status  = StringFormat("BULLISH +%.3f | Gold headwind — avoid BUY", g_DXY_Change);
+      g_DXY_Status  = StringFormat("BULLISH +%.3f | Gold headwind — BUY scores no DXY bonus", g_DXY_Change);
    } else if(g_DXY_Change <= -DXY_MinMove) {
       g_DXY_Bullish = false;
-      g_DXY_Status  = StringFormat("BEARISH %.3f | Gold tailwind — favor BUY", g_DXY_Change);
+      g_DXY_Status  = StringFormat("BEARISH %.3f | Gold tailwind — BUY scores +2 DXY bonus", g_DXY_Change);
    } else {
       // Ranging DXY — no strong signal, allow both directions
       g_DXY_Bullish = false;
@@ -5660,8 +5660,8 @@ void UpdateDashboard() {
 
    // DXY vs Gold logic explainer
    string dxyLogic = !g_DXY_Available ? "Check DXY symbol name in settings" :
-                     g_DXY_Bullish    ? "USD Strengthening — Favor SELL gold, block BUY" :
-                                        "USD Weakening — Favor BUY gold, block SELL";
+                     g_DXY_Bullish    ? "USD Strengthening — SELL gets +2 score bonus" :
+                                        "USD Weakening — BUY gets +2 score bonus";
    SetLabel(PREFIX+"DX2", x, y, dxyLogic,
             g_DXY_Available ? (g_DXY_Bullish ? ColorBear : ColorBull) : ColorWarn,
             FontSize);
@@ -5676,7 +5676,7 @@ void UpdateDashboard() {
    string ccStatus = !UseCandleConfirm ? "Filter OFF" :
                      g_CandleConfirmed ? "CONFIRMED" : "WAITING";
    SetLabel(PREFIX+"CC1", x, y,
-            StringFormat("Status: %s  |  Pattern: %s  |  Required on M15 (Primary) / M5 (Fallback)",
+            StringFormat("Status: %s  |  Pattern: %s  |  +3 score bonus if confirmed on M15/M5",
                          ccStatus, g_CandlePattern),
             ccClr, FontSize);
    y += dy;
