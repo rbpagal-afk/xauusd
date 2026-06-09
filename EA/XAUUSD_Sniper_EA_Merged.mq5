@@ -4747,14 +4747,22 @@ void ManageIdleTrades() {
 //|  TRADE JOURNAL                                                   |
 //+------------------------------------------------------------------+
 
+string GetDailyJournalName() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return StringFormat("XAUUSD_Sniper_Journal_%04d.%02d.%02d.csv",
+                       dt.year, dt.mon, dt.day);
+}
+
 void InitJournal() {
    if(!UseJournal) return;
+   string todayFile = GetDailyJournalName();
    g_JournalPath = TerminalInfoString(TERMINAL_DATA_PATH) +
-                   "\\MQL5\\Files\\" + JournalFileName;
+                   "\\MQL5\\Files\\" + todayFile;
 
-   // Create file with header if it does not exist
-   if(!FileIsExist(JournalFileName, FILE_COMMON)) {
-      int fh = FileOpen(JournalFileName, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   // Create today's file with header if it does not exist yet
+   if(!FileIsExist(todayFile, FILE_COMMON)) {
+      int fh = FileOpen(todayFile, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
       if(fh != INVALID_HANDLE) {
          FileWrite(fh,
             "Date", "Time(PHT)", "Symbol", "Direction", "Strategy",
@@ -4793,7 +4801,21 @@ void JournalWriteTrade(ulong ticket, string strategy, int score,
                        double exitPrice, double profitUSD,
                        bool isBuy, bool beUsed, bool tp1Hit, bool trailUsed) {
    if(!UseJournal) return;
-   int fh = FileOpen(JournalFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   // Use today's dated file — creates new file automatically each day
+   string todayFile = GetDailyJournalName();
+   if(!FileIsExist(todayFile, FILE_COMMON)) {
+      int fhNew = FileOpen(todayFile, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+      if(fhNew != INVALID_HANDLE) {
+         FileWrite(fhNew,
+            "Date", "Time(PHT)", "Symbol", "Direction", "Strategy",
+            "Score", "Entry", "SL", "TP1", "TP2",
+            "Lots", "Risk%", "SL_Pips", "Exit", "Profit_USD",
+            "Profit%", "RR_Achieved", "Result", "Session",
+            "BE_Used", "TP1_Hit", "Trail_Used");
+         FileClose(fhNew);
+      }
+   }
+   int fh = FileOpen(todayFile, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
    if(fh == INVALID_HANDLE) return;
    FileSeek(fh, 0, SEEK_END);
 
