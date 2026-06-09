@@ -2786,10 +2786,10 @@ void TryAutoEntry() {
    int    effectiveFallScore  = UseAdaptiveLearning ? g_DynFallbackScore : MinFallbackScore;
    int    effectiveTertScore  = UseAdaptiveLearning ? g_DynTertiaryScore : MinTertiaryScore;
 
-   // Apply per-session score floor
-   effectivePrimScore = MathMax(effectivePrimScore, sp.minScore);
-   effectiveFallScore = MathMax(effectiveFallScore, sp.minScore);
-   effectiveTertScore = MathMax(effectiveTertScore, sp.minScore);
+   // Session score takes priority — use whichever is LOWER so session floors work correctly
+   effectivePrimScore = MathMin(effectivePrimScore, sp.minScore);
+   effectiveFallScore = MathMin(effectiveFallScore, sp.minScore);
+   effectiveTertScore = MathMin(effectiveTertScore, sp.minScore);
 
    // Check session suspension
    if(IsSessionSuspended()) {
