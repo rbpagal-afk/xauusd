@@ -1339,7 +1339,7 @@ input double           MaxSpreadPips     = 30.0;   // Max allowed spread in pips
 input int              MaxSlippagePips   = 3;       // Max slippage in pips
 
 input group            "=== HIGH IMPACT NEWS FILTER ==="
-input bool             UseNewsFilter     = true;   // Block trades near high impact news
+input bool             UseNewsFilter     = false;  // Block trades near high impact news
 input bool             BlockHighOnly     = true;   // true=High only | false=High+Medium
 input int              NewsMinutesBefore = 30;     // Minutes before news to block entry
 input int              NewsMinutesAfter  = 30;     // Minutes after news to resume
@@ -1441,7 +1441,7 @@ input int              ScaledScore2      = 9;      // Score threshold for 2 simu
 input int              ScaledScore3      = 10;     // Score threshold for 3 simultaneous entries
 
 input group            "=== ATR VOLATILITY FILTER ==="
-input bool             UseATRFilter       = true;    // Block entries when market is too choppy or spiking
+input bool             UseATRFilter       = false;   // Block entries when market is too choppy or spiking
 input int              ATR_Period         = 14;       // ATR period (H1 bars)
 input double           ATR_ChopThreshold  = 8.0;     // Block if H1 ATR < this many pips (dead chop)
 input double           ATR_SpikeThreshold = 60.0;    // Block if H1 ATR > this many pips (news spike)
@@ -2047,7 +2047,7 @@ void UpdateNewsCalendar() {
 //| Check if near a high impact news event — uses calendar data     |
 //+------------------------------------------------------------------+
 bool IsNearNews() {
-   if(!UseNewsFilter) return false;
+   return false; // News filter disabled — never blocks
    return g_NewsBlocked;
 }
 
@@ -2153,7 +2153,7 @@ void CheckSMTDivergence() {
 //| DXY filter check — returns true if trade direction is OK        |
 //+------------------------------------------------------------------+
 bool IsDXYAligned(bool isBuyTrade) {
-   if(!UseDXYFilter)      return true;
+   return true; // DXY is a score bonus only — never blocks
    if(!g_DXY_Available)   return true; // If DXY not available, don't block
 
    // DXY ranging = both directions allowed
@@ -2172,7 +2172,7 @@ bool IsDXYAligned(bool isBuyTrade) {
 //| at the entry timeframe before allowing auto entry               |
 //+------------------------------------------------------------------+
 bool CheckCandleConfirmation(bool isBuy, ENUM_TIMEFRAMES tf) {
-   if(!UseCandleConfirm) { g_CandlePattern = "Filter OFF"; return true; }
+   g_CandlePattern = "Score bonus only"; return true; // Candle confirmation is a score bonus — never blocks
 
    double open[], high[], low[], close[];
    ArraySetAsSeries(open,  true);
@@ -2703,7 +2703,7 @@ void TryAutoEntry() {
    }
 
    // ATR volatility filter — block entries during dead chop and news spike blow-offs
-   if(UseATRFilter) {
+   if(false) { // ATR filter disabled — never blocks
       int atrHnd  = iATR(_Symbol, TF_H1, ATR_Period);
       double atrBuf[];
       ArraySetAsSeries(atrBuf, true);
