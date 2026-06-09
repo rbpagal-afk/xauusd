@@ -1765,6 +1765,16 @@ struct MonthlyPerf {
 };
 MonthlyPerf g_MonthlyPerf[];   // Dynamically grown as months pass
 
+// Time-slot report tracking (3 slots per day PHT: 07-12, 12-18, 18-22)
+int        g_LastReportSlot    = -1;  // 0=morning, 1=afternoon, 2=evening
+datetime   g_LastReportDate    = 0;
+
+// Slot trade accumulators (reset each slot)
+int        g_SlotTrades        = 0;
+int        g_SlotWins          = 0;
+double     g_SlotProfit        = 0;
+double     g_SlotLoss          = 0;
+
 //--- Visual tracking — avoid redrawing every tick
 datetime   g_LastVisualBar     = 0;
 
@@ -1856,6 +1866,8 @@ double OnTester() {
    double metric       = profitFactor * winRate * ddPenalty;
 
    if(GenerateReport) GenerateHTMLReport();
+   // Write final slot report for last partial slot
+   if(g_LastReportSlot >= 0) WriteSlotReport(g_LastReportSlot);
    return metric;
 }
 
@@ -2428,6 +2440,7 @@ void OnTick() {
    UpdateMonthlyPnL();
    UpdateDrawdown();
    CheckSessionClose();
+   CheckSlotReports();
    ManageCapitalProtection();
    ManageIdleTrades();
    ManagePendingOrders();
@@ -4778,6 +4791,142 @@ void EnsureSessionJournalHeader(string fileName) {
    FileClose(fh);
 }
 
+// Returns 0=Morning(07-12), 1=Afternoon(12-18), 2=Evening(18-22), -1=outside
+int GetTimeSlot() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int phtHour = (dt.hour + 8) % 24;
+   if(phtHour >= 7  && phtHour < 12) return 0;
+   if(phtHour >= 12 && phtHour < 18) return 1;
+   if(phtHour >= 18 && phtHour < 22) return 2;
+   return -1;
+}
+
+string GetSlotLabel(int slot) {
+   if(slot == 0) return "0700-1200";
+   if(slot == 1) return "1200-1800";
+   if(slot == 2) return "1800-2200";
+   return "OTHER";
+}
+
+void WriteSlotReport(int slot) {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dateStr = StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day);
+   string fileName = StringFormat("XAUUSD_Sniper_SlotReport_%s_%s.csv",
+                                   dateStr, GetSlotLabel(slot));
+
+   int fh = FileOpen(fileName, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   if(fh == INVALID_HANDLE) return;
+
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double slotNet   = g_SlotProfit - g_SlotLoss;
+   double slotWR    = g_SlotTrades > 0 ? (double)g_SlotWins / g_SlotTrades * 100.0 : 0;
+   double totalNet  = g_TotalProfit - g_TotalLoss;
+   double totalWR   = g_TotalTrades > 0 ? (double)g_TotalWins / g_TotalTrades * 100.0 : 0;
+   double pf        = g_TotalLoss > 0 ? g_TotalProfit / g_TotalLoss : 0;
+
+   // Header
+   FileWrite(fh, "XAUUSD SNIPER EA — TIME SLOT REPORT");
+   FileWrite(fh, "Date", dateStr);
+   FileWrite(fh, "Slot", GetSlotLabel(slot));
+   FileWrite(fh, "Generated PHT", StringFormat("%02d:%02d", (dt.hour+8)%24, dt.min));
+   FileWrite(fh, "");
+
+   // Slot summary
+   FileWrite(fh, "=== THIS SLOT ===");
+   FileWrite(fh, "Metric", "Value");
+   FileWrite(fh, "Trades",        IntegerToString(g_SlotTrades));
+   FileWrite(fh, "Wins",          IntegerToString(g_SlotWins));
+   FileWrite(fh, "Losses",        IntegerToString(g_SlotTrades - g_SlotWins));
+   FileWrite(fh, "Win Rate %",    StringFormat("%.1f", slotWR));
+   FileWrite(fh, "Gross Profit",  StringFormat("%.2f", g_SlotProfit));
+   FileWrite(fh, "Gross Loss",    StringFormat("%.2f", g_SlotLoss));
+   FileWrite(fh, "Net P&L",       StringFormat("%.2f", slotNet));
+   FileWrite(fh, "");
+
+   // Cumulative day stats
+   FileWrite(fh, "=== CUMULATIVE TODAY ===");
+   FileWrite(fh, "Total Trades",  IntegerToString(g_TotalTrades));
+   FileWrite(fh, "Total Wins",    IntegerToString(g_TotalWins));
+   FileWrite(fh, "Total Losses",  IntegerToString(g_TotalLosses));
+   FileWrite(fh, "Win Rate %",    StringFormat("%.1f", totalWR));
+   FileWrite(fh, "Total Profit",  StringFormat("%.2f", g_TotalProfit));
+   FileWrite(fh, "Total Loss",    StringFormat("%.2f", g_TotalLoss));
+   FileWrite(fh, "Net P&L",       StringFormat("%.2f", totalNet));
+   FileWrite(fh, "Profit Factor", StringFormat("%.2f", pf));
+   FileWrite(fh, "Balance",       StringFormat("%.2f", balance));
+   FileWrite(fh, "Equity",        StringFormat("%.2f", equity));
+   FileWrite(fh, "Drawdown %",    StringFormat("%.2f", g_CurrentDrawdown));
+   FileWrite(fh, "");
+
+   // Per-session stats
+   FileWrite(fh, "=== PER SESSION ===");
+   FileWrite(fh, "Session", "Profit", "Loss", "Net Pips");
+   string sessNames[] = {"Asian KZ","Pre-Market","Pre-London","London Open",
+                         "London Mid","Pre-NY","NY Open","NY PM","Other"};
+   for(int i = 0; i < SESSION_COUNT; i++) {
+      if(g_SessProfit[i] > 0 || g_SessLoss[i] > 0)
+         FileWrite(fh, sessNames[i],
+                   StringFormat("%.2f", g_SessProfit[i]),
+                   StringFormat("%.2f", g_SessLoss[i]),
+                   StringFormat("%.1f", g_SessPips[i]));
+   }
+   FileWrite(fh, "");
+
+   // Monthly grid
+   FileWrite(fh, "=== MONTHLY GRID ===");
+   FileWrite(fh, "Year","Month","Trades","Wins","Losses","Win%","Net P&L","Profit Factor");
+   for(int m = 0; m < ArraySize(g_MonthlyPerf); m++) {
+      MonthlyPerf mp = g_MonthlyPerf[m];
+      int tot = mp.wins + mp.losses;
+      double wr = tot > 0 ? (double)mp.wins/tot*100.0 : 0;
+      double mpf = mp.grossLoss > 0 ? mp.grossProfit/mp.grossLoss : 0;
+      double net = mp.grossProfit - mp.grossLoss;
+      FileWrite(fh,
+         IntegerToString(mp.year),
+         IntegerToString(mp.month),
+         IntegerToString(tot),
+         IntegerToString(mp.wins),
+         IntegerToString(mp.losses),
+         StringFormat("%.1f", wr),
+         StringFormat("%.2f", net),
+         StringFormat("%.2f", mpf));
+   }
+
+   FileClose(fh);
+
+   // Reset slot accumulators after writing
+   g_SlotTrades = 0;
+   g_SlotWins   = 0;
+   g_SlotProfit = 0;
+   g_SlotLoss   = 0;
+}
+
+// Called every tick — checks if slot boundary crossed and writes report
+void CheckSlotReports() {
+   int curSlot = GetTimeSlot();
+   if(curSlot < 0) return;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime today = StringToTime(StringFormat("%04d.%02d.%02d 00:00", dt.year, dt.mon, dt.day));
+
+   // New day reset
+   if(today != g_LastReportDate) {
+      g_LastReportDate = today;
+      g_LastReportSlot = -1;
+      g_SlotTrades = 0; g_SlotWins = 0; g_SlotProfit = 0; g_SlotLoss = 0;
+   }
+
+   // Slot changed — write report for the completed slot
+   if(curSlot != g_LastReportSlot && g_LastReportSlot >= 0) {
+      WriteSlotReport(g_LastReportSlot);
+   }
+   g_LastReportSlot = curSlot;
+}
+
 void InitJournal() {
    if(!UseJournal) return;
    string todayFile = GetDailyJournalName();
@@ -4912,6 +5061,11 @@ void JournalWriteTrade(ulong ticket, string strategy, int score,
    g_TotalTrades++;
    if(profitUSD >= 0) { g_TotalWins++;   g_TotalProfit += profitUSD; }
    else               { g_TotalLosses++; g_TotalLoss   += MathAbs(profitUSD); }
+
+   // Update time-slot accumulators
+   g_SlotTrades++;
+   if(profitUSD >= 0) { g_SlotWins++; g_SlotProfit += profitUSD; }
+   else               { g_SlotLoss  += MathAbs(profitUSD); }
 
    // Per-session extended stats
    int si = GetSessionIndex();
