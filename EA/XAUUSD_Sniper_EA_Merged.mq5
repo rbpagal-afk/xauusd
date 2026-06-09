@@ -1306,7 +1306,7 @@ input double           MinRR             = 2.0;    // Minimum Risk:Reward
 input group            "=== DAILY PROFIT & LOSS LIMITS ==="
 input double           DailyProfitTarget = 5.0;    // Daily profit target % (e.g. 5 = stop at +5%)
 input double           DailyLossLimit    = 2.0;    // Daily max loss % (e.g. 2 = stop at -2%)
-input int              MaxDailyTrades    = 3;       // Max total trades per day
+input int              MaxDailyTrades    = 10;      // Max total trades per day
 input int              MaxConsecLosses   = 2;       // Max consecutive losses before stopping
 
 input group            "=== TRADE PROTECTION ==="
