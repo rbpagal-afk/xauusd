@@ -1391,30 +1391,30 @@ input group            "=== SESSION-SPECIFIC SETTINGS ==="
 // ── Pre-London Spike Window (1:30PM-3PM PHT) — Asian range sweep, Judas Swing setups ──
 input bool             TradePreLondon       = true;   // Trade pre-London spike window (1:30-3PM PHT)
 input double           PreLondonRisk        = 1.0;    // Pre-London risk % (reduced — spike volatility)
-input int              PreLondonMinScore    = 10;     // Min score (high bar — Judas confirmation required)
+input int              PreLondonMinScore    = 6;      // Min score for Pre-London window
 input int              PreLondonBlackoutMins = 90;    // Window size in minutes before London open (3PM PHT)
 // ── Pre-NY Spike Window (7:30PM-8PM PHT) — London range sweep, Judas Swing setups ──
 input bool             TradePreNY           = true;   // Trade pre-NY spike window (7:30-8PM PHT)
 input double           PreNYRisk            = 1.0;    // Pre-NY risk % (reduced — spike volatility)
-input int              PreNYMinScore        = 10;     // Min score (high bar — Judas + DXY confirmation)
+input int              PreNYMinScore        = 6;      // Min score for Pre-NY window
 input int              PreNYBlackoutMins    = 30;     // Window size in minutes before NY open (8PM PHT)
 // ── DEPRECATED: hard blackout toggle (kept for compatibility — use risk/score controls above) ──
 input bool             UsePreSessionBlackout = false; // Hard-block all entries in pre-session windows
 // ── London Open (3PM-5PM PHT) — Judas Sweep reversal + trending ──
 input double           LondonRisk         = 2.0;    // London Open risk % (full — best trending window)
-input int              LondonMinScore     = 7;      // Min score for London Open w/ Judas Swing (no-Judas = +2)
+input int              LondonMinScore     = 5;      // Min score for London Open
 input double           LondonTP2_RR       = 3.0;    // London TP2 RR (wider — trending moves)
 // ── London Session (5PM-8PM PHT) — selective, continuation only ──
 input double           LondonMidRisk      = 1.5;    // London Mid risk % (reduced — selective trades only)
-input int              LondonMidMinScore  = 9;      // Min score for London Mid (higher bar)
+input int              LondonMidMinScore  = 6;      // Min score for London Mid
 input int              LondonMidMaxTrades = 1;      // Max simultaneous trades during London Mid
 // ── NY Open (8PM-11PM PHT) — best window, full power ──
 input double           NYOpenRisk         = 2.0;    // NY Open risk % (full — highest-probability window)
-input int              NYOpenMinScore     = 7;      // Min score for NY Open (Judas Swing = same +2 rule)
+input int              NYOpenMinScore     = 5;      // Min score for NY Open
 input double           NYOpenTP2_RR       = 3.5;    // NY Open TP2 RR (slightly wider — strong momentum)
 // ── NY PM / Silver Bullet (11PM-1AM PHT) — wind down, SB only ──
 input double           NYPMRisk           = 1.0;    // NY PM risk % (reduced — wind-down, SB setups only)
-input int              NYPMMinScore       = 9;      // Min score for NY PM entries
+input int              NYPMMinScore       = 6;      // Min score for NY PM entries
 input double           NYPMMaxTrades_New  = 1;      // No new trades if already 1 open during NY PM
 input double           NYPMTP2_RR         = 2.0;    // NY PM TP2 RR (tighter — less time left in session)
 
@@ -1422,7 +1422,7 @@ input group            "=== ASIAN SESSION (5AM-7AM PHT) ==="
 input bool             TradePremarket     = true;   // Allow trades during Pre-Market 7AM-3PM PHT (Asian extension rules)
 input bool             TradeAsianSession  = true;   // Allow trades during Asian KZ (5AM-7AM PHT)
 input double           AsianRisk          = 0.5;    // Risk % during Asian session (smaller — range market)
-input int              AsianMinScore      = 9;      // Minimum score to trade Asian session (higher bar)
+input int              AsianMinScore      = 5;      // Min score for Asian session
 input double           AsianTP1_RR        = 0.8;    // TP1 RR for Asian (tighter — range fading)
 input double           AsianTP2_RR        = 1.5;    // TP2 RR for Asian (target opposite range wall)
 input double           AsianMaxSpread     = 20.0;   // Block Asian trade if spread > this (pips)
@@ -2611,7 +2611,7 @@ SessionParams GetSessionParams() {
          // Judas required → tight score bar; without Judas → very high bar (avoid fakes)
          bool hasJudas = g_M15.isJudasSwing || g_M5.isJudasSwing || g_H1.isJudasSwing;
          p.risk         = PreLondonRisk;
-         p.minScore     = hasJudas ? PreLondonMinScore : PreLondonMinScore + 3;
+         p.minScore     = PreLondonMinScore;
          p.maxNewTrades = TradePreLondon ? 1 : 0;
          p.tp1RR        = TP1_RR;
          p.tp2RR        = LondonTP2_RR;   // Same target as London — delivering into London session
@@ -2623,7 +2623,7 @@ SessionParams GetSessionParams() {
          // Sharp moves before NY open. Trade reversal at very high confluence only.
          bool hasJudas = g_M15.isJudasSwing || g_M5.isJudasSwing || g_H1.isJudasSwing;
          p.risk         = PreNYRisk;
-         p.minScore     = hasJudas ? PreNYMinScore : PreNYMinScore + 3;
+         p.minScore     = PreNYMinScore;
          p.maxNewTrades = TradePreNY ? 1 : 0;
          p.tp1RR        = TP1_RR;
          p.tp2RR        = NYOpenTP2_RR;   // Same target as NY — delivering into NY open
@@ -2635,7 +2635,7 @@ SessionParams GetSessionParams() {
          p.risk         = LondonRisk;
          // Judas Swing detected → low score OK (it's the holy grail setup)
          // No Judas Swing → require higher confluence before trading London trend
-         p.minScore     = hasJudas ? LondonMinScore : LondonMinScore + 2;
+         p.minScore     = LondonMinScore;
          p.maxNewTrades = 99;
          p.tp1RR        = TP1_RR;
          p.tp2RR        = LondonTP2_RR;
