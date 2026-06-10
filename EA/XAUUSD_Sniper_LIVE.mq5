@@ -6,7 +6,7 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "14.00"
+#property version     "15.00"
 #property description "XAUUSD Sniper EA — Telegram Remote Control v13.17"
 #property strict
 
@@ -389,7 +389,9 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    if(!a.bullish && close[0] < minorLow)  a.hasInternalBOS = true;
 
    //================================================================
-   // CHOCH — first structural break opposite to recent swing
+   // CHOCH — Change of Character: first structural break OPPOSITE to trend
+   // ICT: in an uptrend CHoCH = first lower low (bearish reversal signal)
+   //       in a downtrend CHoCH = first higher high (bullish reversal signal)
    //================================================================
    a.hasCHoCH = false;
    if(lookback >= 10) {
@@ -397,12 +399,17 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
       double recentLow  = low [ArrayMinimum(low,  1, 5)];
       double prevHigh   = high[ArrayMaximum(high, 6, MathMin(12, lookback-6))];
       double prevLow    = low [ArrayMinimum(low,  6, MathMin(12, lookback-6))];
-      if(a.bullish  && recentHigh > prevHigh && close[0] > recentHigh) a.hasCHoCH = true;
-      if(!a.bullish && recentLow  < prevLow  && close[0] < recentLow)  a.hasCHoCH = true;
+      // Uptrend CHoCH: first lower low breaks bullish character → bearish reversal signal
+      if( a.bullish && recentLow  < prevLow  && close[0] < recentLow)  a.hasCHoCH = true;
+      // Downtrend CHoCH: first higher high breaks bearish character → bullish reversal signal
+      if(!a.bullish && recentHigh > prevHigh && close[0] > recentHigh) a.hasCHoCH = true;
    }
 
    //================================================================
    // LIQUIDITY SWEEP — must be computed before MSS (MSS requires it)
+   // Detect regardless of bullish flag: wick beyond prior swing then reversed back.
+   // sell-side sweep: wick below prior swing low, closed above → BUY reversal setup
+   // buy-side  sweep: wick above prior swing high, closed below → SELL reversal setup
    //================================================================
    a.hasLiqSweep = false;
    a.sweepLevel  = 0;
@@ -411,10 +418,12 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
       for(int i = 1; i < swLB; i++) {
          double psLow  = low [ArrayMinimum(low,  i+1, MathMin(10, lookback-i-1))];
          double psHigh = high[ArrayMaximum(high, i+1, MathMin(10, lookback-i-1))];
-         if(a.bullish && low[i] < psLow && close[i] > psLow) {
+         // Sell-side sweep (wick below prior low, closed above) → potential BUY
+         if(low[i] < psLow && close[i] > psLow) {
             a.hasLiqSweep = true; a.sweepLevel = psLow; break;
          }
-         if(!a.bullish && high[i] > psHigh && close[i] < psHigh) {
+         // Buy-side sweep (wick above prior high, closed below) → potential SELL
+         if(high[i] > psHigh && close[i] < psHigh) {
             a.hasLiqSweep = true; a.sweepLevel = psHigh; break;
          }
       }
@@ -1020,17 +1029,17 @@ SMCAnalysis AnalyzeSMC(string symbol, ENUM_TIMEFRAMES tf,
    if(a.hasNDOG || a.hasNWOG)        a.score += 1;  // Opening gap present
    if(a.hasWeakHigh && !a.bullish)    a.score += 1;  // Weak high = sweep target above
    if(a.hasWeakLow  &&  a.bullish)    a.score += 1;  // Weak low  = sweep target below
-   // --- PDH / PDL / PWH / PWL (max +8) ---
-   // AT the level with sweep = highest-probability ICT reversal
-   if(a.sweepPDH && !a.bullish)           a.score += 4; // PDH swept → SELL reversal
-   if(a.sweepPDL &&  a.bullish)           a.score += 4; // PDL swept → BUY  reversal
-   if(a.sweepPWH && !a.bullish)           a.score += 5; // PWH swept → major SELL signal
-   if(a.sweepPWL &&  a.bullish)           a.score += 5; // PWL swept → major BUY  signal
+   // --- PDH / PDL / PWH / PWL ---
+   // sweepPDH/PWH is self-directional (wick above + close below); score unconditionally.
+   if(a.sweepPDH)                           a.score += 4; // PDH swept → SELL reversal
+   if(a.sweepPDL)                           a.score += 4; // PDL swept → BUY  reversal
+   if(a.sweepPWH)                           a.score += 5; // PWH swept → major SELL signal
+   if(a.sweepPWL)                           a.score += 5; // PWL swept → major BUY  signal
    // AT the level without confirmed sweep = potential reaction
-   if(a.atPDH && !a.bullish && !a.sweepPDH) a.score += 2;
-   if(a.atPDL &&  a.bullish && !a.sweepPDL) a.score += 2;
-   if(a.atPWH && !a.bullish && !a.sweepPWH) a.score += 3;
-   if(a.atPWL &&  a.bullish && !a.sweepPWL) a.score += 3;
+   if(a.atPDH && !a.sweepPDH) a.score += 2;
+   if(a.atPDL && !a.sweepPDL) a.score += 2;
+   if(a.atPWH && !a.sweepPWH) a.score += 3;
+   if(a.atPWL && !a.sweepPWL) a.score += 3;
    // Penalty: buying toward PDH overhead or selling toward PDL below = fighting levels
    if(a.runningToPDH &&  a.bullish)       a.score -= 2;
    if(a.runningToPDL && !a.bullish)       a.score -= 2;
@@ -1146,15 +1155,17 @@ int ScorePrimaryAdvanced(SMCAnalysis &h4, SMCAnalysis &h1, SMCAnalysis &m15) {
    if(m15.hasWeakLow  &&  h4.bullish)              score += 1; // Weak low as bull target
    if(m15.hasWeakHigh && !h4.bullish)              score += 1; // Weak high as bear target
 
-   // PDH / PDL / PWH / PWL — Daily & Weekly liquidity levels (max +8)
-   if(h4.sweepPWH && !h4.bullish)                 score += 5; // PWH swept → major SELL
-   if(h4.sweepPWL &&  h4.bullish)                 score += 5; // PWL swept → major BUY
-   if(h1.sweepPDH && !h4.bullish)                 score += 4; // PDH swept → SELL reversal
-   if(h1.sweepPDL &&  h4.bullish)                 score += 4; // PDL swept → BUY  reversal
-   if(h1.atPDH    && !h4.bullish && !h1.sweepPDH) score += 2; // At PDH, no sweep yet
-   if(h1.atPDL    &&  h4.bullish && !h1.sweepPDL) score += 2; // At PDL, no sweep yet
-   if(h4.atPWH    && !h4.bullish && !h4.sweepPWH) score += 3; // At PWH, no sweep yet
-   if(h4.atPWL    &&  h4.bullish && !h4.sweepPWL) score += 3; // At PWL, no sweep yet
+   // PDH / PDL / PWH / PWL — Daily & Weekly liquidity levels
+   // sweepPDH/PWH is already directional (wick above + close below = SELL reversal).
+   // Score unconditionally — direction override in TryAutoEntry handles isBuy alignment.
+   if(h4.sweepPWH)                                score += 5; // PWH swept → major SELL
+   if(h4.sweepPWL)                                score += 5; // PWL swept → major BUY
+   if(h1.sweepPDH || h4.sweepPDH)                score += 4; // PDH swept → SELL reversal
+   if(h1.sweepPDL || h4.sweepPDL)                score += 4; // PDL swept → BUY  reversal
+   if(h1.atPDH && !h1.sweepPDH)                  score += 2; // At PDH, no sweep yet
+   if(h1.atPDL && !h1.sweepPDL)                  score += 2; // At PDL, no sweep yet
+   if(h4.atPWH && !h4.sweepPWH)                  score += 3; // At PWH, no sweep yet
+   if(h4.atPWL && !h4.sweepPWL)                  score += 3; // At PWL, no sweep yet
    if(h1.runningToPDH &&  h4.bullish)             score -= 2; // Buying into PDH overhead
    if(h1.runningToPDL && !h4.bullish)             score -= 2; // Selling into PDL below
 
@@ -2917,6 +2928,32 @@ void TryAutoEntry() {
          g_EntryLog = "NY PM: PRIMARY blocked (wind-down — scalp tiers only outside SB window), no fallback tier";
          return;
       }
+   }
+
+   // ── ICT SWEEP DIRECTION OVERRIDE ──
+   // Core ICT principle: after price sweeps buy-side (PDH/PWH) or sell-side (PDL/PWL) liquidity,
+   // the trade direction is ALWAYS opposite to the sweep, regardless of HTF macro bias.
+   // H4/H1 bias can lag: the sweep reversal shows first on M15/M5.
+   // sweepPDH / sweepPWH = buy-side liq taken → bearish reversal → SELL
+   // sweepPDL / sweepPWL = sell-side liq taken → bullish reversal → BUY
+   // aboveAsianHigh + bearish (reversed) → SELL; belowAsianLow + bullish (reversed) → BUY
+   {
+      bool sweepedBuySide  = g_H4.sweepPWH  || g_H1.sweepPDH  || g_H1.sweepPWH  ||
+                             g_M15.sweepPDH || g_M15.sweepPWH || g_M5.sweepPDH  ||
+                             (g_M15.aboveAsianHigh && !g_M15.bullish) ||
+                             (g_M5.aboveAsianHigh  && !g_M5.bullish);
+      bool sweepedSellSide = g_H4.sweepPWL  || g_H1.sweepPDL  || g_H1.sweepPWL  ||
+                             g_M15.sweepPDL || g_M15.sweepPWL || g_M5.sweepPDL  ||
+                             (g_M15.belowAsianLow && g_M15.bullish) ||
+                             (g_M5.belowAsianLow  && g_M5.bullish);
+      if(sweepedBuySide && !sweepedSellSide) {
+         isBuy = false;
+         strategy += "_SWEEP";
+      } else if(sweepedSellSide && !sweepedBuySide) {
+         isBuy = true;
+         strategy += "_SWEEP";
+      }
+      // When both conflict (consolidation crossing multiple levels), keep HTF bias
    }
 
    // ── JUDAS SWING DIRECTION OVERRIDE ──
