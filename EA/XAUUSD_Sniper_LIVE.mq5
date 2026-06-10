@@ -6,7 +6,7 @@
 //|  Capital Protection: Full suite including daily limits & news    |
 //+------------------------------------------------------------------+
 #property copyright   "XAUUSD Sniper Strategy"
-#property version     "15.00"
+#property version     "15.10"
 #property description "XAUUSD Sniper EA — Telegram Remote Control v13.17"
 #property strict
 
@@ -1312,12 +1312,13 @@ input group            "=== RISK PER TRADE ==="
 input double           PrimaryRisk       = 2.0;    // Primary risk % (H4→H1→M15)
 input double           FallbackRisk      = 1.0;    // Fallback risk % (H1→M15→M5)
 input double           TertiaryRisk      = 0.5;    // Tertiary risk % (M15→M5→M1 scalp)
+input double           MinTertiaryBalance = 1000;  // Min balance ($) to allow TERTIARY M1 scalps
 input double           MinRR             = 2.0;    // Minimum Risk:Reward
 
 input group            "=== DAILY PROFIT & LOSS LIMITS ==="
 input double           DailyProfitTarget = 5.0;    // Daily profit target % (e.g. 5 = stop at +5%)
 input double           DailyLossLimit    = 2.0;    // Daily max loss % (e.g. 2 = stop at -2%)
-input int              MaxDailyTrades    = 10;      // Max total trades per day
+input int              MaxDailyTrades    = 3;       // Max total trades per day (spread cost control)
 input int              MaxConsecLosses   = 2;       // Max consecutive losses before stopping
 
 input group            "=== TRADE PROTECTION ==="
@@ -2070,7 +2071,6 @@ void UpdateNewsCalendar() {
 //| Check if near a high impact news event — uses calendar data     |
 //+------------------------------------------------------------------+
 bool IsNearNews() {
-   return false; // News filter disabled — never blocks
    return g_NewsBlocked;
 }
 
@@ -2830,6 +2830,14 @@ void TryAutoEntry() {
    // Tier 3: M15 → M5 → M1 (only when both primary and fallback not ready)
    bool tertiaryReady = !primaryReady && !fallbackReady && (g_TertiaryScore >= effectiveTertScore);
 
+   // TERTIARY (M1 scalps) disabled on small accounts: spread eats the tight TPs.
+   // Below MinTertiaryBalance the tier is pure cost — PRIMARY/FALLBACK only.
+   if(tertiaryReady && AccountInfoDouble(ACCOUNT_BALANCE) < MinTertiaryBalance) {
+      g_EntryLog = StringFormat("TERTIARY OFF: balance $%.0f < $%.0f minimum (M1 scalps = spread donation)",
+                                AccountInfoDouble(ACCOUNT_BALANCE), MinTertiaryBalance);
+      tertiaryReady = false;
+   }
+
    if(!primaryReady && !fallbackReady && !tertiaryReady) { g_AlertSent = false; return; }
 
    // Pick the active tier
@@ -2866,7 +2874,8 @@ void TryAutoEntry() {
       if(primaryReady) {
          primaryReady  = false;
          fallbackReady = (g_FallbackScore >= effectiveFallScore);
-         tertiaryReady = !fallbackReady && (g_TertiaryScore >= effectiveTertScore);
+         tertiaryReady = !fallbackReady && (g_TertiaryScore >= effectiveTertScore) &&
+                         (AccountInfoDouble(ACCOUNT_BALANCE) >= MinTertiaryBalance);
          if(fallbackReady) {
             isBuy    = g_H1.bullish;
             score    = g_FallbackScore;
@@ -2937,13 +2946,24 @@ void TryAutoEntry() {
    // sweepPDH / sweepPWH = buy-side liq taken → bearish reversal → SELL
    // sweepPDL / sweepPWL = sell-side liq taken → bullish reversal → BUY
    // aboveAsianHigh + bearish (reversed) → SELL; belowAsianLow + bullish (reversed) → BUY
+   // SWEEP RECLAIM INVALIDATION: if price has since CLOSED back beyond the swept level,
+   // the sweep failed (reclaim = continuation, often violent) — the reversal premise is void.
+   // e.g. PDH swept (wick above, close below) but price now trades ABOVE PDH = breakout, not sweep.
    {
-      bool sweepedBuySide  = g_H4.sweepPWH  || g_H1.sweepPDH  || g_H1.sweepPWH  ||
-                             g_M15.sweepPDH || g_M15.sweepPWH || g_M5.sweepPDH  ||
+      double m15Close = iClose(_Symbol, TF_M15, 1); // last completed M15 close
+      bool pdhReclaimed = (g_H1.prevDayHigh  > 0 && m15Close > g_H1.prevDayHigh);
+      bool pdlReclaimed = (g_H1.prevDayLow   > 0 && m15Close < g_H1.prevDayLow);
+      bool pwhReclaimed = (g_H4.prevWeekHigh > 0 && m15Close > g_H4.prevWeekHigh);
+      bool pwlReclaimed = (g_H4.prevWeekLow  > 0 && m15Close < g_H4.prevWeekLow);
+
+      bool sweepedBuySide  = ((g_H4.sweepPWH || g_H1.sweepPWH) && !pwhReclaimed) ||
+                             ((g_H1.sweepPDH || g_M15.sweepPDH || g_M5.sweepPDH) && !pdhReclaimed) ||
+                             (g_M15.sweepPWH && !pwhReclaimed) ||
                              (g_M15.aboveAsianHigh && !g_M15.bullish) ||
                              (g_M5.aboveAsianHigh  && !g_M5.bullish);
-      bool sweepedSellSide = g_H4.sweepPWL  || g_H1.sweepPDL  || g_H1.sweepPWL  ||
-                             g_M15.sweepPDL || g_M15.sweepPWL || g_M5.sweepPDL  ||
+      bool sweepedSellSide = ((g_H4.sweepPWL || g_H1.sweepPWL) && !pwlReclaimed) ||
+                             ((g_H1.sweepPDL || g_M15.sweepPDL || g_M5.sweepPDL) && !pdlReclaimed) ||
+                             (g_M15.sweepPWL && !pwlReclaimed) ||
                              (g_M15.belowAsianLow && g_M15.bullish) ||
                              (g_M5.belowAsianLow  && g_M5.bullish);
       if(sweepedBuySide && !sweepedSellSide) {
@@ -3056,8 +3076,11 @@ void TryAutoEntry() {
          g_DailyBiasDate   = TimeCurrent();
       }
    }
-   // NY Open: if daily bias is locked, only trade in bias direction
-   if(curSessIdx == SESS_NY_OPEN && g_DailyBiasLocked) {
+   // NY Open: if daily bias is locked, only trade in bias direction.
+   // EXCEPTION: NY Judas (sweep of the London range) overrides the lock — it's the exact
+   // signal that London was the manipulation leg and the real move is the NY reversal.
+   if(curSessIdx == SESS_NY_OPEN && g_DailyBiasLocked &&
+      !nyLondonJudasBull && !nyLondonJudasBear) {
       if(isBuy != g_DailyBias) {
          g_EntryLog = StringFormat("NY BIAS FILTER: %s trade blocked — London set %s bias today",
                                    isBuy ? "BUY" : "SELL",
@@ -3125,7 +3148,14 @@ void TryAutoEntry() {
                           StringFind(ref.obStatus, "In OB") >= 0); // Inside OB
       atZone = atZone || ref.atIPDALevel;     // At IPDA 20/40/60 day boundary
       atZone = atZone || g_M15.inOTE || g_M15.atCE;
-      if(atZone) score += 3; // At sniper zone = bonus, not a blocker
+      if(atZone) {
+         score += 3; // At sniper zone = bonus for all tiers
+      } else if(primaryReady) {
+         // PRIMARY tier: entry location is the edge — HARD BLOCK if not at a zone.
+         // Mid-range entry after a sweep turns 1:3 RR into 1:1. Wait for the retrace.
+         g_EntryLog = "ZONE GATE: PRIMARY needs price AT OTE/CE/OB/IPDA — waiting for retrace";
+         return;
+      }
    }
 
    // ── CANDLE CONFIRMATION — adds to score instead of blocking ──
